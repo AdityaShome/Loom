@@ -28,6 +28,10 @@ str_enum!(
     /// Supersedes newer -> older; RefersTo referrer -> referenced.
     EdgeKind { ToolPair, Follows, RefersTo, Supersedes, SummaryOf, DerivedFrom }
 );
+str_enum!(
+    /// What to do with a node when building the next request.
+    Action { Keep, Summarize, Drop }
+);
 str_enum!(Status { Full, Summarized, Dropped, DroppedByAgent });
 
 /// One context item in provider-neutral form, as produced by `normalize`.

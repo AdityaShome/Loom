@@ -14,6 +14,7 @@ loom-store = { path = "../loom-store" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+ulid.workspace = true
 axum.workspace = true
 bytes.workspace = true
 futures-util.workspace = true

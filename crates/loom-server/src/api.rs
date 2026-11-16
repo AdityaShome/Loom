@@ -9,11 +9,15 @@ use axum::{
     },
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, patch, post, put},
     Json, Router,
 };
-use loom_core::model::Node;
-use serde::Serialize;
+use loom_core::{
+    model::{Action, Node},
+    policy::{self, Matcher, Plan, PolicyRule, Weights},
+};
+use loom_store::{NodePatch, SessionUpdate};
+use serde::{Deserialize, Serialize};
 
 use crate::gateway::State;
 
@@ -25,6 +29,13 @@ pub fn routes() -> Router<Arc<State>> {
         .route("/api/sessions/{id}/turns", get(turns))
         .route("/api/sessions/{id}/diff/{a}/{b}", get(diff))
         .route("/ws/sessions/{id}", get(ws))
+        .route("/api/sessions/{id}", put(update_session))
+        .route("/api/sessions/{id}/plan", get(plan))
+        .route("/api/sessions/{id}/match", post(match_rule))
+        .route("/api/nodes/{id}", patch(patch_node))
+        .route("/api/nodes/{id}/restore", post(restore_node))
+        .route("/api/rules", get(list_rules).post(create_rule))
+        .route("/api/rules/{id}", put(update_rule).delete(delete_rule))
 }
 
 async fn turns(AxState(st): AxState<Arc<State>>, Path(id): Path<String>) -> Response {
@@ -119,6 +130,211 @@ async fn graph(AxState(st): AxState<Arc<State>>, Path(id): Path<String>) -> Resp
     let Some(store) = &st.store else { return unavailable() };
     match tokio::try_join!(store.list_nodes(&id), store.list_edges(&id)) {
         Ok((ns, edges)) => Json(Graph { nodes: ns.into_iter().map(view).collect(), edges }).into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+// ---------------------------------------------------------------- policy
+
+fn bad(msg: &str) -> Response {
+    (StatusCode::BAD_REQUEST, msg.to_string()).into_response()
+}
+
+fn not_found(what: &str) -> Response {
+    (StatusCode::NOT_FOUND, format!("unknown {what}")).into_response()
+}
+
+/// Tell live viewers that the next plan changed.
+fn plan_updated(st: &State, session: &str) {
+    let _ = st.events.send(crate::gateway::Event {
+        session: session.to_string(),
+        kind: "plan_updated",
+        turn: 0,
+        new: 0,
+        missing: 0,
+        tokens: 0,
+    });
+}
+
+#[derive(Serialize)]
+struct PlanResponse {
+    plan: Plan,
+    mode: String,
+    /// 0 in settings means "model default"; this is the budget actually used.
+    budget_tokens: u32,
+    budget_is_default: bool,
+    weights: Weights,
+    /// Edits made since the last model call; they apply to the next one.
+    pending_changes: bool,
+}
+
+async fn plan(AxState(st): AxState<Arc<State>>, Path(id): Path<String>) -> Response {
+    let Some(store) = &st.store else { return unavailable() };
+    let res: anyhow::Result<Option<PlanResponse>> = async {
+        let (Some(inp), Some(settings)) = (store.policy_input(&id).await?, store.session_settings(&id).await?) else {
+            return Ok(None);
+        };
+        Ok(Some(PlanResponse {
+            plan: policy::plan(&inp),
+            mode: settings.mode,
+            budget_tokens: inp.budget,
+            budget_is_default: settings.budget_tokens <= 0,
+            weights: inp.weights,
+            pending_changes: store.pending_changes(&id).await?,
+        }))
+    }
+    .await;
+    match res {
+        Ok(Some(p)) => Json(p).into_response(),
+        Ok(None) => not_found("session"),
+        Err(e) => internal(e),
+    }
+}
+
+async fn update_session(AxState(st): AxState<Arc<State>>, Path(id): Path<String>, Json(u): Json<SessionUpdate>) -> Response {
+    let Some(store) = &st.store else { return unavailable() };
+    match u.mode.as_deref() {
+        None | Some("Observe") | Some("Suggest") => {}
+        Some("Enforce") => return bad("Enforce mode is not available yet (it arrives with the rewriter)"),
+        Some(_) => return bad("mode must be Observe or Suggest"),
+    }
+    if u.budget_tokens.is_some_and(|b| b < 0) {
+        return bad("budget_tokens must be >= 0 (0 = model default)");
+    }
+    if let Some(w) = &u.weights {
+        let nums = [w.w_imp, w.w_rec, w.w_ref, w.w_task, w.w_sup, w.tau, w.summarize_threshold];
+        if nums.iter().any(|x| !x.is_finite()) || w.tau <= 0.0 {
+            return bad("weights must be finite numbers and tau must be > 0");
+        }
+    }
+    match store.update_session(&id, &u).await {
+        Ok(true) => {
+            plan_updated(&st, &id);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => not_found("session"),
+        Err(e) => internal(e),
+    }
+}
+
+async fn patch_node(AxState(st): AxState<Arc<State>>, Path(id): Path<String>, Json(p): Json<NodePatch>) -> Response {
+    let Some(store) = &st.store else { return unavailable() };
+    if p.importance.is_some_and(|i| !i.is_finite()) {
+        return bad("importance must be a number between 0 and 1");
+    }
+    match store.patch_node(&id, &p).await {
+        Ok(Some(session)) => {
+            plan_updated(&st, &session);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(None) => not_found("node"),
+        Err(e) => internal(e),
+    }
+}
+
+async fn restore_node(AxState(st): AxState<Arc<State>>, Path(id): Path<String>) -> Response {
+    let Some(store) = &st.store else { return unavailable() };
+    match store.restore_node(&id).await {
+        Ok(Some(session)) => {
+            plan_updated(&st, &session);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(None) => not_found("node"),
+        Err(e) => internal(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct RuleQuery {
+    session: Option<String>,
+}
+
+async fn list_rules(AxState(st): AxState<Arc<State>>, axum::extract::Query(q): axum::extract::Query<RuleQuery>) -> Response {
+    let Some(store) = &st.store else { return unavailable() };
+    match store.list_rules(q.session.as_deref()).await {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct RuleBody {
+    session_id: Option<String>,
+    matcher: Matcher,
+    action: Action,
+    #[serde(default)]
+    priority: i32,
+}
+
+async fn save_rule(st: &State, id: String, b: RuleBody) -> Response {
+    let Some(store) = &st.store else { return unavailable() };
+    if b.matcher.is_empty() {
+        return bad("a rule needs at least one condition (kind, source_glob, min_tokens, older_than_turns)");
+    }
+    let rule = PolicyRule { id, session_id: b.session_id, matcher: b.matcher, action: b.action, priority: b.priority };
+    match store.upsert_rule(&rule).await {
+        Ok(()) => {
+            match &rule.session_id {
+                Some(s) => plan_updated(st, s),
+                None => {
+                    if let Ok(all) = store.list_sessions().await {
+                        all.iter().for_each(|s| plan_updated(st, &s.id));
+                    }
+                }
+            }
+            (StatusCode::OK, Json(rule)).into_response()
+        }
+        Err(e) => internal(e),
+    }
+}
+
+async fn create_rule(AxState(st): AxState<Arc<State>>, Json(b): Json<RuleBody>) -> Response {
+    save_rule(&st, ulid::Ulid::new().to_string(), b).await
+}
+
+async fn update_rule(AxState(st): AxState<Arc<State>>, Path(id): Path<String>, Json(b): Json<RuleBody>) -> Response {
+    save_rule(&st, id, b).await
+}
+
+async fn delete_rule(AxState(st): AxState<Arc<State>>, Path(id): Path<String>) -> Response {
+    let Some(store) = &st.store else { return unavailable() };
+    match store.delete_rule(&id).await {
+        Ok(true) => {
+            if let Ok(all) = store.list_sessions().await {
+                all.iter().for_each(|s| plan_updated(&st, &s.id));
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => not_found("rule"),
+        Err(e) => internal(e),
+    }
+}
+
+#[derive(Serialize)]
+struct MatchResult {
+    count: usize,
+    tokens: u32,
+    ids: Vec<String>,
+}
+
+/// Live match count for the rule editor: which nodes of the next request would this matcher hit?
+async fn match_rule(AxState(st): AxState<Arc<State>>, Path(id): Path<String>, Json(m): Json<Matcher>) -> Response {
+    let Some(store) = &st.store else { return unavailable() };
+    match store.policy_input(&id).await {
+        Ok(Some(inp)) => {
+            let hits: Vec<_> = inp
+                .nodes
+                .iter()
+                .filter(|n| m.matches(n, inp.latest_turn.saturating_sub(n.first_seen_turn)))
+                .collect();
+            Json(MatchResult {
+                count: hits.len(),
+                tokens: hits.iter().map(|n| n.tokens).sum(),
+                ids: hits.iter().map(|n| n.id.clone()).collect(),
+            })
+            .into_response()
+        }
+        Ok(None) => not_found("session"),
         Err(e) => internal(e),
     }
 }

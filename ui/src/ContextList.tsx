@@ -7,13 +7,24 @@ import {
   useReactTable,
   type SortingState,
 } from "@tanstack/react-table";
-import type { NodeRow } from "./api";
+import type { NodeRow, PlanItem } from "./api";
+import Controls from "./Controls";
 import { fmtTokens, KINDS } from "./format";
 
 const col = createColumnHelper<NodeRow>();
 const isNum = (def: unknown) => (def as { meta?: { num?: boolean } }).meta?.num ?? false;
 
-export default function ContextList({ nodes, latest }: { nodes: NodeRow[]; latest: number }) {
+export default function ContextList({
+  nodes,
+  latest,
+  plan,
+  onEdit,
+}: {
+  nodes: NodeRow[];
+  latest: number;
+  plan: Map<string, PlanItem>;
+  onEdit: () => void;
+}) {
   const [kind, setKind] = useState("");
   const [q, setQ] = useState("");
   const [showGone, setShowGone] = useState(false);
@@ -50,7 +61,29 @@ export default function ContextList({ nodes, latest }: { nodes: NodeRow[]; lates
       col.accessor("tokens", { header: "Tokens", cell: (c) => fmtTokens(c.getValue()), meta: { num: true } }),
       col.accessor("first_seen_turn", {
         header: "Seen",
-        cell: (c) => `t${c.getValue() + 1}–t${c.row.original.last_seen_turn + 1}`,
+        cell: (c) => <span className="nowrap">{`t${c.getValue() + 1}–t${c.row.original.last_seen_turn + 1}`}</span>,
+      }),
+      col.display({
+        id: "plan",
+        header: "Plan",
+        enableSorting: false,
+        cell: ({ row: { original: n } }) => {
+          const it = plan.get(n.id);
+          return it ? (
+            <span className={`dec d-${it.decision}`} title={it.reason}>
+              {it.decision}
+            </span>
+          ) : (
+            <span className="muted">—</span>
+          );
+        },
+      }),
+      col.accessor("score", { header: "Score", cell: (c) => (plan.get(c.row.original.id)?.score ?? c.getValue()).toFixed(2), meta: { num: true } }),
+      col.display({
+        id: "controls",
+        header: "Controls",
+        enableSorting: false,
+        cell: ({ row: { original: n } }) => (n.status === "DroppedByAgent" ? null : <Controls n={n} item={plan.get(n.id)} onEdit={onEdit} />),
       }),
       col.accessor("status", {
         header: "Status",
@@ -61,7 +94,7 @@ export default function ContextList({ nodes, latest }: { nodes: NodeRow[]; lates
         ),
       }),
     ],
-    [],
+    [plan, onEdit],
   );
 
   const table = useReactTable({
@@ -90,6 +123,7 @@ export default function ContextList({ nodes, latest }: { nodes: NodeRow[]; lates
         </label>
         <span className="muted">{rows.length} shown</span>
       </div>
+      <div className="tablewrap">
       <table className="grid">
         <thead>
           {table.getHeaderGroups().map((hg) => (
@@ -123,6 +157,7 @@ export default function ContextList({ nodes, latest }: { nodes: NodeRow[]; lates
           ))}
         </tbody>
       </table>
+      </div>
     </>
   );
 }

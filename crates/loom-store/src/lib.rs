@@ -6,9 +6,10 @@ use anyhow::{anyhow, Result};
 use loom_core::{
     graph::{build_edges, Edge, GNode},
     matching::{canonical_hash, count_tokens, match_nodes, message_overhead, occurrences, Match},
-    model::{CanonMsg, EdgeKind, Node, NodeKind, Provider, Role, Status},
+    model::{Action, CanonMsg, EdgeKind, Node, NodeKind, Provider, Role, Status},
+    policy::{budget_for, Matcher, PNode, PolicyInput, PolicyRule, Weights},
 };
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize};
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous},
     Row, SqlitePool,
@@ -61,6 +62,42 @@ pub struct TurnRow {
 pub struct TurnDiff {
     pub added: Vec<String>,
     pub removed: Vec<String>,
+}
+
+/// Partial update of a node's user controls. `user_action: null` clears the override.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct NodePatch {
+    pub importance: Option<f32>,
+    pub pinned: Option<bool>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub user_action: Option<Option<Action>>,
+}
+
+fn double_option<'de, D, T>(d: D) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Some(Option::deserialize(d)?))
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SessionUpdate {
+    pub budget_tokens: Option<i64>,
+    pub mode: Option<String>,
+    pub weights: Option<Weights>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionSettings {
+    pub id: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    /// 0 = use the model default.
+    pub budget_tokens: i64,
+    pub mode: String,
+    pub weights: Weights,
+    pub edited_at: i64,
 }
 
 fn now_ms() -> i64 {
@@ -350,6 +387,198 @@ impl Store {
         Ok(Some(TurnDiff {
             added: ib.iter().filter(|i| !sa.contains(i)).cloned().collect(),
             removed: ia.iter().filter(|i| !sb.contains(i)).cloned().collect(),
+        }))
+    }
+
+    pub async fn session_settings(&self, id: &str) -> Result<Option<SessionSettings>> {
+        let Some(r) = sqlx::query("SELECT id, provider, model, budget_tokens, mode, weights, edited_at FROM sessions WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let weights: Option<String> = r.get("weights");
+        Ok(Some(SessionSettings {
+            id: r.get("id"),
+            provider: r.get("provider"),
+            model: r.get("model"),
+            budget_tokens: r.get("budget_tokens"),
+            mode: r.get("mode"),
+            weights: weights.and_then(|w| serde_json::from_str(&w).ok()).unwrap_or_default(),
+            edited_at: r.get("edited_at"),
+        }))
+    }
+
+    /// Returns false if the session does not exist.
+    pub async fn update_session(&self, id: &str, u: &SessionUpdate) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        if let Some(b) = u.budget_tokens {
+            sqlx::query("UPDATE sessions SET budget_tokens = ? WHERE id = ?").bind(b).bind(id).execute(&mut *tx).await?;
+        }
+        if let Some(m) = &u.mode {
+            sqlx::query("UPDATE sessions SET mode = ? WHERE id = ?").bind(m).bind(id).execute(&mut *tx).await?;
+        }
+        if let Some(w) = &u.weights {
+            sqlx::query("UPDATE sessions SET weights = ? WHERE id = ?")
+                .bind(serde_json::to_string(w)?)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let n = sqlx::query("UPDATE sessions SET edited_at = ? WHERE id = ?").bind(now_ms()).bind(id).execute(&mut *tx).await?.rows_affected();
+        tx.commit().await?;
+        Ok(n > 0)
+    }
+
+    /// Apply a patch; returns the node's session id, or `None` if the node does not exist.
+    pub async fn patch_node(&self, id: &str, p: &NodePatch) -> Result<Option<String>> {
+        let mut tx = self.pool.begin().await?;
+        let Some(session): Option<String> =
+            sqlx::query_scalar("SELECT session_id FROM nodes WHERE id = ?").bind(id).fetch_optional(&mut *tx).await?
+        else {
+            return Ok(None);
+        };
+        if let Some(i) = p.importance {
+            sqlx::query("UPDATE nodes SET importance = ? WHERE id = ?").bind(i.clamp(0.0, 1.0) as f64).bind(id).execute(&mut *tx).await?;
+        }
+        if let Some(pin) = p.pinned {
+            sqlx::query("UPDATE nodes SET pinned = ? WHERE id = ?").bind(pin as i64).bind(id).execute(&mut *tx).await?;
+        }
+        if let Some(a) = &p.user_action {
+            sqlx::query("UPDATE nodes SET user_action = ? WHERE id = ?").bind(a.map(|a| a.as_str())).bind(id).execute(&mut *tx).await?;
+        }
+        sqlx::query("UPDATE sessions SET edited_at = ? WHERE id = ?").bind(now_ms()).bind(&session).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(Some(session))
+    }
+
+    /// Bring a dropped or summarized node back: force it to be kept.
+    pub async fn restore_node(&self, id: &str) -> Result<Option<String>> {
+        self.patch_node(id, &NodePatch { user_action: Some(Some(Action::Keep)), ..Default::default() }).await
+    }
+
+    /// Rules for a session: global rules plus that session's own. `None` lists all.
+    pub async fn list_rules(&self, session: Option<&str>) -> Result<Vec<PolicyRule>> {
+        let rows = match session {
+            Some(s) => sqlx::query("SELECT * FROM rules WHERE session_id IS NULL OR session_id = ? ORDER BY priority DESC, rowid")
+                .bind(s)
+                .fetch_all(&self.pool)
+                .await?,
+            None => sqlx::query("SELECT * FROM rules ORDER BY priority DESC, rowid").fetch_all(&self.pool).await?,
+        };
+        rows.iter()
+            .map(|r| {
+                Ok(PolicyRule {
+                    id: r.get("id"),
+                    session_id: r.get("session_id"),
+                    matcher: serde_json::from_str::<Matcher>(r.get::<&str, _>("matcher"))?,
+                    action: Action::parse(r.get("action")).ok_or_else(|| anyhow!("corrupt rule action"))?,
+                    priority: r.get::<i64, _>("priority") as i32,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn upsert_rule(&self, r: &PolicyRule) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO rules (id, session_id, matcher, action, priority) VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET session_id = excluded.session_id, matcher = excluded.matcher,
+               action = excluded.action, priority = excluded.priority",
+        )
+        .bind(&r.id)
+        .bind(&r.session_id)
+        .bind(serde_json::to_string(&r.matcher)?)
+        .bind(r.action.as_str())
+        .bind(r.priority as i64)
+        .execute(&self.pool)
+        .await?;
+        self.touch(r.session_id.as_deref()).await
+    }
+
+    pub async fn delete_rule(&self, id: &str) -> Result<bool> {
+        let scope: Option<Option<String>> =
+            sqlx::query_scalar("SELECT session_id FROM rules WHERE id = ?").bind(id).fetch_optional(&self.pool).await?;
+        let Some(scope) = scope else { return Ok(false) };
+        sqlx::query("DELETE FROM rules WHERE id = ?").bind(id).execute(&self.pool).await?;
+        self.touch(scope.as_deref()).await?;
+        Ok(true)
+    }
+
+    /// Mark edits as pending: one session, or every session for a global rule.
+    async fn touch(&self, session: Option<&str>) -> Result<()> {
+        match session {
+            Some(s) => sqlx::query("UPDATE sessions SET edited_at = ? WHERE id = ?").bind(now_ms()).bind(s).execute(&self.pool).await?,
+            None => sqlx::query("UPDATE sessions SET edited_at = ?").bind(now_ms()).execute(&self.pool).await?,
+        };
+        Ok(())
+    }
+
+    /// Edits made since the last model call that the next request will reflect.
+    pub async fn pending_changes(&self, session_id: &str) -> Result<bool> {
+        let r: Option<(i64, Option<i64>)> = sqlx::query_as(
+            "SELECT s.edited_at, (SELECT MAX(created_at) FROM turns t WHERE t.session_id = s.id) FROM sessions s WHERE s.id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(matches!(r, Some((edited, last)) if edited > last.unwrap_or(0)))
+    }
+
+    /// Everything the policy needs for the next request of a session: the nodes
+    /// of the latest request (in order), their edges, settings and rules.
+    pub async fn policy_input(&self, session_id: &str) -> Result<Option<PolicyInput>> {
+        let Some(settings) = self.session_settings(session_id).await? else { return Ok(None) };
+        let latest: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(idx) FROM turns WHERE session_id = ?").bind(session_id).fetch_one(&self.pool).await?;
+        let Some(latest) = latest else { return Ok(None) };
+
+        let nodes: Vec<Node> = sqlx::query(
+            "SELECT * FROM nodes WHERE session_id = ? AND last_seen_turn = ? AND status != 'DroppedByAgent' ORDER BY position",
+        )
+        .bind(session_id)
+        .bind(latest)
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(node_from_row)
+        .collect::<Result<_>>()?;
+
+        let present: std::collections::HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        let edges: Vec<Edge> = self
+            .list_edges(session_id)
+            .await?
+            .into_iter()
+            .filter(|e| present.contains(e.from.as_str()) && present.contains(e.to.as_str()))
+            .collect();
+
+        let budget = if settings.budget_tokens > 0 {
+            settings.budget_tokens.min(u32::MAX as i64) as u32
+        } else {
+            budget_for(settings.model.as_deref())
+        };
+        let pnodes = nodes
+            .into_iter()
+            .map(|n| PNode {
+                id: n.id,
+                kind: n.kind,
+                content: n.content,
+                tokens: n.tokens,
+                first_seen_turn: n.first_seen_turn,
+                source: n.source,
+                importance: n.importance,
+                pinned: n.pinned,
+                user_action: n.user_action.as_deref().and_then(Action::parse),
+            })
+            .collect();
+        Ok(Some(PolicyInput {
+            nodes: pnodes,
+            edges,
+            latest_turn: latest as u32,
+            budget,
+            weights: settings.weights,
+            rules: self.list_rules(Some(session_id)).await?,
+            provider: settings.provider.as_deref().and_then(Provider::parse).unwrap_or(Provider::Anthropic),
         }))
     }
 
