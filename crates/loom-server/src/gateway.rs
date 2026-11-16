@@ -18,18 +18,30 @@ const MAX_BODY: usize = 256 * 1024 * 1024;
 
 pub struct State {
     client: reqwest::Client,
-    upstream: String,
+    anthropic: String,
+    openai: String,
 }
 
 impl State {
-    pub fn new(upstream: String) -> Self {
+    pub fn new(anthropic: String, openai: String) -> Self {
         // No automatic decompression or redirects: forward exactly what upstream sends.
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("http client");
-        Self { client, upstream: upstream.trim_end_matches('/').to_string() }
+        Self {
+            client,
+            anthropic: anthropic.trim_end_matches('/').to_string(),
+            openai: openai.trim_end_matches('/').to_string(),
+        }
     }
+}
+
+/// OpenAI-style endpoints go to the OpenAI upstream; everything else to Anthropic.
+fn is_openai(path: &str) -> bool {
+    ["/v1/chat/", "/v1/completions", "/v1/responses", "/v1/embeddings"]
+        .iter()
+        .any(|p| path.starts_with(p))
 }
 
 pub fn router(state: Arc<State>) -> Router {
@@ -66,7 +78,8 @@ async fn proxy(AxState(st): AxState<Arc<State>>, req: Request) -> Response {
     let session = resolve_session(hdr, &body);
 
     let path = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-    let url = format!("{}{}", st.upstream, path);
+    let base = if is_openai(parts.uri.path()) { &st.openai } else { &st.anthropic };
+    let url = format!("{base}{path}");
 
     let mut headers = HeaderMap::new();
     copy_headers(&parts.headers, &mut headers, true);

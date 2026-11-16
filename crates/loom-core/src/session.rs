@@ -11,10 +11,15 @@ pub fn resolve_session(header: Option<&str>, body: &[u8]) -> Option<String> {
         return Some(h.to_string());
     }
     let v: Value = serde_json::from_slice(body).ok()?;
-    let system = v.get("system").map(canonical).unwrap_or_default();
-    let first_user = v
-        .get("messages")?
-        .as_array()?
+    let messages = v.get("messages")?.as_array()?;
+    // Anthropic: top-level `system`. OpenAI: leading system/developer messages.
+    let mut system = v.get("system").map(canonical).unwrap_or_default();
+    for m in messages {
+        if matches!(m.get("role").and_then(Value::as_str), Some("system" | "developer")) {
+            system.push_str(&m.get("content").map(canonical).unwrap_or_default());
+        }
+    }
+    let first_user = messages
         .iter()
         .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
         .and_then(|m| m.get("content"))
@@ -56,6 +61,13 @@ mod tests {
     fn differs_by_system() {
         let a = br#"{"system":"S1","messages":[{"role":"user","content":"hi"}]}"#;
         let b = br#"{"system":"S2","messages":[{"role":"user","content":"hi"}]}"#;
+        assert_ne!(resolve_session(None, a), resolve_session(None, b));
+    }
+
+    #[test]
+    fn openai_system_message_counts() {
+        let a = br#"{"messages":[{"role":"system","content":"S1"},{"role":"user","content":"hi"}]}"#;
+        let b = br#"{"messages":[{"role":"system","content":"S2"},{"role":"user","content":"hi"}]}"#;
         assert_ne!(resolve_session(None, a), resolve_session(None, b));
     }
 

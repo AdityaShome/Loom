@@ -47,7 +47,7 @@ use futures_util::StreamExt;
 #[tokio::test]
 async fn streams_byte_identical_and_passes_headers() {
     let upstream = serve(Router::new().route("/v1/messages", post(fake_upstream))).await;
-    let proxy = serve(gateway::router(Arc::new(gateway::State::new(upstream)))).await;
+    let proxy = serve(gateway::router(Arc::new(gateway::State::new(upstream.clone(), upstream)))).await;
 
     let resp = reqwest::Client::new()
         .post(format!("{proxy}/v1/messages"))
@@ -67,7 +67,18 @@ async fn streams_byte_identical_and_passes_headers() {
 
 #[tokio::test]
 async fn upstream_down_returns_502() {
-    let proxy = serve(gateway::router(Arc::new(gateway::State::new("http://127.0.0.1:1".into())))).await;
+    let proxy = serve(gateway::router(Arc::new(gateway::State::new("http://127.0.0.1:1".into(), "http://127.0.0.1:1".into())))).await;
     let resp = reqwest::Client::new().post(format!("{proxy}/v1/messages")).body("{}").send().await.unwrap();
     assert_eq!(resp.status(), 502);
+}
+
+#[tokio::test]
+async fn routes_openai_paths_to_openai_upstream() {
+    let anthropic = serve(Router::new().fallback(|| async { "anthropic" })).await;
+    let openai = serve(Router::new().fallback(|| async { "openai" })).await;
+    let proxy = serve(gateway::router(Arc::new(gateway::State::new(anthropic, openai)))).await;
+    let c = reqwest::Client::new();
+    let a = c.post(format!("{proxy}/v1/messages")).body("{}").send().await.unwrap().text().await.unwrap();
+    let o = c.post(format!("{proxy}/v1/chat/completions")).body("{}").send().await.unwrap().text().await.unwrap();
+    assert_eq!((a.as_str(), o.as_str()), ("anthropic", "openai"));
 }
