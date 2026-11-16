@@ -1,0 +1,24 @@
+[package]
+name = "loom-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "loom"
+path = "src/main.rs"
+
+[dependencies]
+loom-core = { path = "../loom-core" }
+axum.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+futures-util.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
