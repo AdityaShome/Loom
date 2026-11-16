@@ -45,6 +45,21 @@ pub struct SessionRow {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnRow {
+    pub idx: i64,
+    pub request_tokens: i64,
+    pub created_at: i64,
+    pub nodes: i64,
+}
+
+/// Node ids that entered / left the request between two turns.
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnDiff {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -248,6 +263,43 @@ impl Store {
         .fetch_optional(&self.pool)
         .await?;
         s.map(|s| serde_json::from_str(&s).map_err(Into::into)).transpose()
+    }
+
+    pub async fn list_turns(&self, session_id: &str) -> Result<Vec<TurnRow>> {
+        let rows = sqlx::query(
+            "SELECT t.idx, t.request_tokens, t.created_at, sn.sent_node_ids
+             FROM turns t JOIN snapshots sn ON sn.turn_id = t.id
+             WHERE t.session_id = ? ORDER BY t.idx",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                let ids: Vec<String> = serde_json::from_str(r.get::<&str, _>("sent_node_ids"))?;
+                Ok(TurnRow {
+                    idx: r.get("idx"),
+                    request_tokens: r.get("request_tokens"),
+                    created_at: r.get("created_at"),
+                    nodes: ids.len() as i64,
+                })
+            })
+            .collect()
+    }
+
+    /// What changed between turn `a` and turn `b`; `None` if either turn is unknown.
+    pub async fn diff_turns(&self, session_id: &str, a: u32, b: u32) -> Result<Option<TurnDiff>> {
+        let (Some(ia), Some(ib)) =
+            (self.snapshot_node_ids(session_id, a).await?, self.snapshot_node_ids(session_id, b).await?)
+        else {
+            return Ok(None);
+        };
+        let (sa, sb): (std::collections::HashSet<_>, std::collections::HashSet<_>) =
+            (ia.iter().collect(), ib.iter().collect());
+        Ok(Some(TurnDiff {
+            added: ib.iter().filter(|i| !sa.contains(i)).cloned().collect(),
+            removed: ia.iter().filter(|i| !sb.contains(i)).cloned().collect(),
+        }))
     }
 
     pub async fn turn_count(&self, session_id: &str) -> Result<i64> {

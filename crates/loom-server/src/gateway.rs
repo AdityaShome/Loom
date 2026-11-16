@@ -26,6 +26,20 @@ pub struct State {
     anthropic: String,
     openai: String,
     pub store: Option<Arc<Store>>,
+    /// Live events for WebSocket subscribers.
+    pub events: tokio::sync::broadcast::Sender<Event>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Event {
+    #[serde(skip)]
+    pub session: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub turn: u32,
+    pub new: usize,
+    pub missing: usize,
+    pub tokens: u32,
 }
 
 impl State {
@@ -40,6 +54,7 @@ impl State {
             anthropic: anthropic.trim_end_matches('/').to_string(),
             openai: openai.trim_end_matches('/').to_string(),
             store: None,
+            events: tokio::sync::broadcast::channel(256).0,
         }
     }
 
@@ -80,6 +95,11 @@ async fn proxy(AxState(st): AxState<Arc<State>>, req: Request) -> Response {
     let start = Instant::now();
     let (parts, body) = req.into_parts();
 
+    // Browser requests for the web UI (anything GET outside /v1).
+    if parts.method == axum::http::Method::GET && !parts.uri.path().starts_with("/v1/") {
+        return crate::ui::serve(&parts.uri).unwrap_or_else(crate::ui::not_built);
+    }
+
     let body = match axum::body::to_bytes(body, MAX_BODY).await {
         Ok(b) => b,
         Err(e) => return error(StatusCode::BAD_REQUEST, &format!("read body: {e}")),
@@ -94,7 +114,8 @@ async fn proxy(AxState(st): AxState<Arc<State>>, req: Request) -> Response {
         (st.store.clone(), session.clone(), ingest_provider(&parts.method, parts.uri.path()))
     {
         let body = body.clone();
-        tokio::spawn(async move { record(store, provider, sid, body).await });
+        let events = st.events.clone();
+        tokio::spawn(async move { record(store, events, provider, sid, body).await });
     }
 
     let path = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
@@ -158,16 +179,33 @@ fn ingest_provider(method: &axum::http::Method, path: &str) -> Option<Provider> 
     }
 }
 
-async fn record(store: Arc<Store>, provider: Provider, session: String, body: bytes::Bytes) {
+async fn record(
+    store: Arc<Store>,
+    events: tokio::sync::broadcast::Sender<Event>,
+    provider: Provider,
+    session: String,
+    body: bytes::Bytes,
+) {
     let n = match normalize(provider, &body) {
         Ok(n) => n,
         Err(e) => return tracing::warn!(%session, error = %e, "skip ingest: unparseable body"),
     };
     match store.ingest(&session, provider, n.model.as_deref(), &n.msgs).await {
-        Ok(r) => tracing::info!(
-            %session, turn = r.turn, messages = r.total, new = r.new, missing = r.missing, tokens = r.tokens,
-            "ingested"
-        ),
+        Ok(r) => {
+            tracing::info!(
+                %session, turn = r.turn, messages = r.total, new = r.new, missing = r.missing, tokens = r.tokens,
+                "ingested"
+            );
+            // Err just means nobody is listening.
+            let _ = events.send(Event {
+                session,
+                kind: "turn_completed",
+                turn: r.turn,
+                new: r.new,
+                missing: r.missing,
+                tokens: r.tokens,
+            });
+        }
         Err(e) => tracing::warn!(%session, error = %e, "ingest failed"),
     }
 }

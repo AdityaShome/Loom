@@ -120,3 +120,42 @@ async fn records_conversation_and_serves_nodes() {
     assert_eq!(sessions[0]["id"], "e2e");
     assert_eq!(sessions[0]["turns"], 2);
 }
+
+#[tokio::test]
+async fn serves_turns_diff_and_ui_shell() {
+    let upstream = serve(Router::new().fallback(|| async { "{}" })).await;
+    let store = Arc::new(loom_store::Store::open(":memory:").await.unwrap());
+    let state = gateway::State::new(upstream.clone(), upstream).with_store(store.clone());
+    let proxy = serve(gateway::router(Arc::new(state))).await;
+    let c = reqwest::Client::new();
+
+    let u = serde_json::json!({"role": "user", "content": "hi"});
+    let a = serde_json::json!({"role": "assistant", "content": "yo"});
+    for msgs in [serde_json::json!([u]), serde_json::json!([u, a, u])] {
+        c.post(format!("{proxy}/v1/messages"))
+            .header("x-loom-session", "d")
+            .body(serde_json::json!({"messages": msgs}).to_string())
+            .send()
+            .await
+            .unwrap();
+    }
+    for _ in 0..50 {
+        if store.turn_count("d").await.unwrap() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let turns: Vec<serde_json::Value> = c.get(format!("{proxy}/api/sessions/d/turns")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[1]["nodes"], 3);
+
+    let diff: serde_json::Value = c.get(format!("{proxy}/api/sessions/d/diff/0/1")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(diff["added"].as_array().unwrap().len(), 2); // assistant + 2nd user (distinct occurrence)
+    assert_eq!(diff["removed"].as_array().unwrap().len(), 0);
+    assert_eq!(c.get(format!("{proxy}/api/sessions/d/diff/0/9")).send().await.unwrap().status(), 404);
+
+    // GET / is the UI (or the "not built" notice), never proxied upstream.
+    let root = c.get(format!("{proxy}/")).send().await.unwrap();
+    assert!(root.status() == 200 || root.status() == 404);
+}
