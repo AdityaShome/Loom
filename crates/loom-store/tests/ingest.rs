@@ -81,3 +81,42 @@ async fn sessions_are_isolated_and_listed() {
     assert_eq!(sessions.len(), 2);
     assert!(sessions.iter().all(|s| s.turns == 1 && s.nodes == 2 && s.model.as_deref() == Some("m")));
 }
+
+fn read_pair(id: &str, path: &str, out: &str) -> [Value; 2] {
+    [
+        json!({"role":"assistant","content":[{"type":"tool_use","id":id,"name":"Read","input":{"file_path":path}}]}),
+        json!({"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":out}]}),
+    ]
+}
+
+#[tokio::test]
+async fn ingest_builds_edges_incrementally_and_idempotently() {
+    let store = Store::open(":memory:").await.unwrap();
+    let mut msgs = vec![json!({"role":"user","content":"fix auth"})];
+    msgs.extend(read_pair("t1", "/repo/src/auth.rs", "fn old(){}"));
+    let r1 = ingest(&store, "g", &msgs).await;
+    // system, user, call, file -> follows x3, tool pair x1
+    assert_eq!(r1.edges, 4);
+
+    msgs.push(json!({"role":"assistant","content":"The bug is in src/auth.rs line 3."}));
+    msgs.extend(read_pair("t2", "/repo/src/auth.rs", "fn new(){}"));
+    let r2 = ingest(&store, "g", &msgs).await;
+    // new nodes: assistant, call2, file2.
+    // follows x3, tool pair x1, supersedes x1 (file2 -> file1), refers_to x2 (assistant -> file1, call2 -> file1)
+    assert_eq!(r2.edges, 7);
+
+    // Same request again adds nothing.
+    assert_eq!(ingest(&store, "g", &msgs).await.edges, 0);
+
+    use loom_core::model::EdgeKind::*;
+    let nodes = store.list_nodes("g").await.unwrap();
+    let id_of = |pred: &dyn Fn(&loom_core::model::Node) -> bool| nodes.iter().find(|n| pred(n)).unwrap().id.clone();
+    let file1 = id_of(&|n| n.content == "fn old(){}");
+    let file2 = id_of(&|n| n.content == "fn new(){}");
+    let edges = store.list_edges("g").await.unwrap();
+    let has = |k, f: &str, t: &str| edges.iter().any(|e| e.kind == k && e.from == f && e.to == t);
+    assert!(has(Supersedes, &file2, &file1));
+    assert_eq!(edges.iter().filter(|e| e.kind == ToolPair).count(), 2);
+    assert_eq!(edges.iter().filter(|e| e.kind == RefersTo && e.to == file1).count(), 2);
+    assert_eq!(edges.len(), 11);
+}

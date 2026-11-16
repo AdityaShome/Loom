@@ -28,6 +28,9 @@ export type NodeRow = {
 
 export type Turn = { idx: number; request_tokens: number; created_at: number; nodes: number };
 export type Diff = { added: string[]; removed: string[] };
+export type EdgeKind = "ToolPair" | "Follows" | "RefersTo" | "Supersedes" | "SummaryOf" | "DerivedFrom";
+export type Edge = { from: string; to: string; kind: EdgeKind; weight: number };
+export type Graph = { nodes: NodeRow[]; edges: Edge[] };
 export type LiveEvent = { type: string; turn: number; new: number; missing: number; tokens: number };
 
 async function get<T>(path: string): Promise<T> {
@@ -40,6 +43,7 @@ const enc = encodeURIComponent;
 export const api = {
   sessions: () => get<Session[]>("/api/sessions"),
   nodes: (id: string) => get<NodeRow[]>(`/api/sessions/${enc(id)}/nodes`),
+  graph: (id: string) => get<Graph>(`/api/sessions/${enc(id)}/graph`),
   turns: (id: string) => get<Turn[]>(`/api/sessions/${enc(id)}/turns`),
   diff: (id: string, a: number, b: number) => get<Diff>(`/api/sessions/${enc(id)}/diff/${a}/${b}`),
 };

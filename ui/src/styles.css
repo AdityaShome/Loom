@@ -121,3 +121,42 @@ main { padding-top: 16px; }
 .sign { font-weight: 700; width: 12px; }
 .empty { text-align: center; padding: 48px 0; color: var(--muted); }
 .empty h2 { color: var(--text); }
+
+/* Graph view */
+:root {
+  --st-Full: #3b82f6;
+  --st-Summarized: #f59e0b;
+  --st-Dropped: #9ca3af;
+  --st-DroppedByAgent: #ef4444;
+  --e-ToolPair: #d97706;
+  --e-Supersedes: #dc2626;
+  --e-RefersTo: #2563eb;
+  --e-Follows: #a8a29e;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --st-Full: #60a5fa;
+    --e-ToolPair: #fbbf24;
+    --e-Supersedes: #f87171;
+    --e-RefersTo: #60a5fa;
+    --e-Follows: #57534e;
+  }
+}
+.graph-wrap { display: grid; grid-template-columns: 1fr 300px; gap: 12px; align-items: start; }
+@media (max-width: 860px) { .graph-wrap { grid-template-columns: 1fr; } }
+.cy { height: 560px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+.side { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-height: 120px; font-size: 13px; }
+.side h4 { margin: 0 0 6px; font-size: 13px; }
+.side .kv { display: flex; gap: 8px; color: var(--muted); margin: 2px 0; }
+.side pre { white-space: pre-wrap; word-break: break-word; margin: 8px 0; font: 12px ui-monospace, Consolas, monospace; max-height: 140px; overflow: auto; }
+.rels { list-style: none; padding: 0; margin: 6px 0 0; }
+.rels li { display: flex; gap: 6px; align-items: center; padding: 3px 0; cursor: pointer; }
+.rels li:hover { text-decoration: underline; }
+.rels .preview { flex: 1; min-width: 0; }
+.ekind { font-size: 11px; font-weight: 600; white-space: nowrap; }
+.ekind.ToolPair { color: var(--e-ToolPair); }
+.ekind.Supersedes { color: var(--e-Supersedes); }
+.ekind.RefersTo { color: var(--e-RefersTo); }
+.ekind.Follows { color: var(--muted); }
+.glegend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--muted); margin-top: 8px; }
+.sw { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 4px; vertical-align: -1px; }

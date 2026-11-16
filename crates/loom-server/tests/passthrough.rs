@@ -159,3 +159,30 @@ async fn serves_turns_diff_and_ui_shell() {
     let root = c.get(format!("{proxy}/")).send().await.unwrap();
     assert!(root.status() == 200 || root.status() == 404);
 }
+
+#[tokio::test]
+async fn graph_endpoint_returns_nodes_and_edges() {
+    let upstream = serve(Router::new().fallback(|| async { "{}" })).await;
+    let store = Arc::new(loom_store::Store::open(":memory:").await.unwrap());
+    let state = gateway::State::new(upstream.clone(), upstream).with_store(store.clone());
+    let proxy = serve(gateway::router(Arc::new(state))).await;
+    let c = reqwest::Client::new();
+
+    let msgs = serde_json::json!([
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"cmd": "ls"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "a b"}]}
+    ]);
+    c.post(format!("{proxy}/v1/messages")).header("x-loom-session", "g").body(serde_json::json!({"messages": msgs}).to_string()).send().await.unwrap();
+    for _ in 0..50 {
+        if store.turn_count("g").await.unwrap() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let g: serde_json::Value = c.get(format!("{proxy}/api/sessions/g/graph")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(g["nodes"].as_array().unwrap().len(), 3);
+    let edges = g["edges"].as_array().unwrap();
+    assert_eq!(edges.iter().filter(|e| e["kind"] == "ToolPair").count(), 1);
+    assert_eq!(edges.iter().filter(|e| e["kind"] == "Follows").count(), 2);
+}

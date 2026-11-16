@@ -23,6 +23,11 @@ str_enum!(
     /// Role as sent to the provider API.
     Role { System, User, Assistant, Tool }
 );
+str_enum!(
+    /// Edge direction: ToolPair call -> result; Follows later -> earlier;
+    /// Supersedes newer -> older; RefersTo referrer -> referenced.
+    EdgeKind { ToolPair, Follows, RefersTo, Supersedes, SummaryOf, DerivedFrom }
+);
 str_enum!(Status { Full, Summarized, Dropped, DroppedByAgent });
 
 /// One context item in provider-neutral form, as produced by `normalize`.

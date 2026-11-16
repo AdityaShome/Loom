@@ -1,14 +1,21 @@
-import { useState } from "react";
+import { lazy, Suspense, useState } from "react";
 import { api } from "./api";
 import { useLive, useLoad } from "./hooks";
 import BudgetBar from "./BudgetBar";
 import ContextList from "./ContextList";
 import TurnDiff from "./TurnDiff";
 
+// Cytoscape is large; load it only when the Graph tab opens.
+const GraphView = lazy(() => import("./GraphView"));
+
 const DEFAULT_BUDGET = 200_000;
 
 export default function SessionView({ id }: { id: string }) {
-  const [tab, setTab] = useState<"context" | "diff">("context");
+  const [tab, setTab] = useState<"context" | "graph" | "diff">(() => {
+    const t = new URLSearchParams(location.hash.split("?")[1]).get("tab");
+    return t === "graph" || t === "diff" ? t : "context";
+  });
+  const [tick, setTick] = useState(0);
   const sessions = useLoad(api.sessions, [id]);
   const nodes = useLoad(() => api.nodes(id), [id]);
   const turns = useLoad(() => api.turns(id), [id]);
@@ -17,6 +24,7 @@ export default function SessionView({ id }: { id: string }) {
     sessions.reload();
     nodes.reload();
     turns.reload();
+    setTick((t) => t + 1);
   });
 
   const session = sessions.data?.find((s) => s.id === id);
@@ -45,6 +53,9 @@ export default function SessionView({ id }: { id: string }) {
         <button className={tab === "context" ? "active" : ""} onClick={() => setTab("context")}>
           Context <span className="count">{inContext.length}</span>
         </button>
+        <button className={tab === "graph" ? "active" : ""} onClick={() => setTab("graph")}>
+          Graph
+        </button>
         <button className={tab === "diff" ? "active" : ""} onClick={() => setTab("diff")}>
           Turn diff
         </button>
@@ -52,6 +63,10 @@ export default function SessionView({ id }: { id: string }) {
 
       {tab === "context" ? (
         <ContextList nodes={nodes.data} latest={latest} />
+      ) : tab === "graph" ? (
+        <Suspense fallback={<p className="muted">Loading graph…</p>}>
+          <GraphView sessionId={id} tick={tick} latest={latest} />
+        </Suspense>
       ) : (
         <TurnDiff sessionId={id} turns={turns.data} nodes={nodes.data} />
       )}

@@ -4,7 +4,7 @@ import SessionView from "./SessionView";
 
 export default function App() {
   const route = useRoute();
-  const m = route.match(/^\/s\/(.+)$/);
+  const m = route.match(/^\/s\/([^?]+)/);
   return (
     <div className="app">
       <header className="top">

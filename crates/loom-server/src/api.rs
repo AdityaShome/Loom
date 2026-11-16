@@ -21,6 +21,7 @@ pub fn routes() -> Router<Arc<State>> {
     Router::new()
         .route("/api/sessions", get(sessions))
         .route("/api/sessions/{id}/nodes", get(nodes))
+        .route("/api/sessions/{id}/graph", get(graph))
         .route("/api/sessions/{id}/turns", get(turns))
         .route("/api/sessions/{id}/diff/{a}/{b}", get(diff))
         .route("/ws/sessions/{id}", get(ws))
@@ -94,19 +95,30 @@ async fn sessions(AxState(st): AxState<Arc<State>>) -> Response {
     }
 }
 
+fn view(mut node: Node) -> NodeView {
+    let preview: String = node.content.chars().take(200).collect();
+    node.content.clear(); // full content stays in the store; lists get a preview
+    NodeView { node, preview }
+}
+
 async fn nodes(AxState(st): AxState<Arc<State>>, Path(id): Path<String>) -> Response {
     let Some(store) = &st.store else { return unavailable() };
     match store.list_nodes(&id).await {
-        Ok(ns) => Json(
-            ns.into_iter()
-                .map(|mut node| {
-                    let preview: String = node.content.chars().take(200).collect();
-                    node.content.clear(); // full content stays in the store; the list view gets a preview
-                    NodeView { node, preview }
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
+        Ok(ns) => Json(ns.into_iter().map(view).collect::<Vec<_>>()).into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+#[derive(Serialize)]
+struct Graph {
+    nodes: Vec<NodeView>,
+    edges: Vec<loom_core::graph::Edge>,
+}
+
+async fn graph(AxState(st): AxState<Arc<State>>, Path(id): Path<String>) -> Response {
+    let Some(store) = &st.store else { return unavailable() };
+    match tokio::try_join!(store.list_nodes(&id), store.list_edges(&id)) {
+        Ok((ns, edges)) => Json(Graph { nodes: ns.into_iter().map(view).collect(), edges }).into_response(),
         Err(e) => internal(e),
     }
 }

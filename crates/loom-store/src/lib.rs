@@ -4,8 +4,9 @@ use std::{collections::HashMap, str::FromStr, time::Duration};
 
 use anyhow::{anyhow, Result};
 use loom_core::{
+    graph::{build_edges, Edge, GNode},
     matching::{canonical_hash, count_tokens, match_nodes, message_overhead, occurrences, Match},
-    model::{CanonMsg, Node, NodeKind, Provider, Role, Status},
+    model::{CanonMsg, EdgeKind, Node, NodeKind, Provider, Role, Status},
 };
 use serde::Serialize;
 use sqlx::{
@@ -29,6 +30,8 @@ pub struct IngestOutcome {
     pub new: usize,
     /// Nodes previously seen that the agent no longer sends.
     pub missing: usize,
+    /// Relations (edges) created by this request.
+    pub edges: usize,
     pub tokens: u32,
 }
 
@@ -138,6 +141,7 @@ impl Store {
         let overhead = message_overhead(provider);
         let mut ids = Vec::with_capacity(msgs.len());
         let (mut new, mut tokens) = (0usize, 0u32);
+        let mut new_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (i, ((m, h), (o, mt))) in msgs.iter().zip(&hashes).zip(occs.iter().zip(matches)).enumerate() {
             let t = count_tokens(&m.content) + overhead;
             tokens += t;
@@ -176,9 +180,35 @@ impl Store {
                     .execute(&mut *tx)
                     .await?;
                     new += 1;
+                    new_ids.insert(id.clone());
                     ids.push(id);
                 }
             }
+        }
+
+        // Relations among the nodes of this request; only edges touching new nodes are written.
+        let gnodes: Vec<GNode> = msgs
+            .iter()
+            .zip(&ids)
+            .map(|(m, id)| GNode {
+                id,
+                kind: m.kind,
+                source: m.source.as_deref(),
+                tool_id: m.tool_id.as_deref(),
+                text: Some(&m.content),
+            })
+            .collect();
+        let new_refs: std::collections::HashSet<&str> = new_ids.iter().map(String::as_str).collect();
+        let mut edges = 0usize;
+        for e in build_edges(&gnodes, &new_refs) {
+            edges += sqlx::query("INSERT OR IGNORE INTO edges (from_id, to_id, kind, weight) VALUES (?, ?, ?, ?)")
+                .bind(&e.from)
+                .bind(&e.to)
+                .bind(e.kind.as_str())
+                .bind(e.weight as f64)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected() as usize;
         }
 
         // Nodes we knew about that the agent stopped sending (it compacted or trimmed).
@@ -213,7 +243,7 @@ impl Store {
         .await?;
 
         tx.commit().await?;
-        Ok(IngestOutcome { turn: turn as u32, total: msgs.len(), new, missing, tokens })
+        Ok(IngestOutcome { turn: turn as u32, total: msgs.len(), new, missing, edges, tokens })
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<SessionRow>> {
@@ -263,6 +293,27 @@ impl Store {
         .fetch_optional(&self.pool)
         .await?;
         s.map(|s| serde_json::from_str(&s).map_err(Into::into)).transpose()
+    }
+
+    /// All edges whose source node belongs to the session.
+    pub async fn list_edges(&self, session_id: &str) -> Result<Vec<Edge>> {
+        sqlx::query(
+            "SELECT e.from_id, e.to_id, e.kind, e.weight FROM edges e
+             JOIN nodes n ON n.id = e.from_id WHERE n.session_id = ? ORDER BY e.rowid",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|r| {
+            Ok(Edge {
+                from: r.get("from_id"),
+                to: r.get("to_id"),
+                kind: EdgeKind::parse(r.get("kind")).ok_or_else(|| anyhow!("corrupt edge kind"))?,
+                weight: r.get::<f64, _>("weight") as f32,
+            })
+        })
+        .collect()
     }
 
     pub async fn list_turns(&self, session_id: &str) -> Result<Vec<TurnRow>> {
