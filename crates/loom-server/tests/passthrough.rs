@@ -82,3 +82,41 @@ async fn routes_openai_paths_to_openai_upstream() {
     let o = c.post(format!("{proxy}/v1/chat/completions")).body("{}").send().await.unwrap().text().await.unwrap();
     assert_eq!((a.as_str(), o.as_str()), ("anthropic", "openai"));
 }
+
+#[tokio::test]
+async fn records_conversation_and_serves_nodes() {
+    let upstream = serve(Router::new().fallback(|| async { "{}" })).await;
+    let store = Arc::new(loom_store::Store::open(":memory:").await.unwrap());
+    let state = gateway::State::new(upstream.clone(), upstream).with_store(store);
+    let proxy = serve(gateway::router(Arc::new(state))).await;
+    let c = reqwest::Client::new();
+
+    let req = |msgs: serde_json::Value| {
+        c.post(format!("{proxy}/v1/messages"))
+            .header("x-loom-session", "e2e")
+            .body(serde_json::json!({"model": "m", "system": "S", "messages": msgs}).to_string())
+    };
+    let u = serde_json::json!({"role": "user", "content": "hi"});
+    let a = serde_json::json!({"role": "assistant", "content": "hello"});
+    let u2 = serde_json::json!({"role": "user", "content": "more"});
+    assert_eq!(req(serde_json::json!([u])).send().await.unwrap().status(), 200);
+    assert_eq!(req(serde_json::json!([u, a, u2])).send().await.unwrap().status(), 200);
+
+    // Ingest runs in the background; poll until both turns land.
+    let mut nodes: Vec<serde_json::Value> = Vec::new();
+    for _ in 0..50 {
+        nodes = c.get(format!("{proxy}/api/sessions/e2e/nodes")).send().await.unwrap().json().await.unwrap();
+        if nodes.len() == 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(nodes.len(), 4); // system, hi, hello, more
+    assert_eq!(nodes[1]["preview"], "hi");
+    assert_eq!(nodes[1]["kind"], "User");
+
+    let sessions: Vec<serde_json::Value> =
+        c.get(format!("{proxy}/api/sessions")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(sessions[0]["id"], "e2e");
+    assert_eq!(sessions[0]["turns"], 2);
+}

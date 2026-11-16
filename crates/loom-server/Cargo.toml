@@ -10,6 +10,9 @@ path = "src/main.rs"
 
 [dependencies]
 loom-core = { path = "../loom-core" }
+loom-store = { path = "../loom-store" }
+anyhow.workspace = true
+serde.workspace = true
 axum.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
@@ -21,4 +24,5 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 axum.workspace = true
 futures-util.workspace = true
-reqwest = { workspace = true, features = ["stream"] }
+reqwest = { workspace = true, features = ["stream", "json"] }
+serde_json.workspace = true

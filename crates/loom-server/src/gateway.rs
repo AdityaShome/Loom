@@ -12,7 +12,12 @@ use axum::{
     Router,
 };
 use futures_util::TryStreamExt;
-use loom_core::session::{resolve_session, SESSION_HEADER};
+use loom_core::{
+    model::Provider,
+    normalize::normalize,
+    session::{resolve_session, SESSION_HEADER},
+};
+use loom_store::Store;
 
 const MAX_BODY: usize = 256 * 1024 * 1024;
 
@@ -20,6 +25,7 @@ pub struct State {
     client: reqwest::Client,
     anthropic: String,
     openai: String,
+    pub store: Option<Arc<Store>>,
 }
 
 impl State {
@@ -33,7 +39,13 @@ impl State {
             client,
             anthropic: anthropic.trim_end_matches('/').to_string(),
             openai: openai.trim_end_matches('/').to_string(),
+            store: None,
         }
+    }
+
+    pub fn with_store(mut self, store: Arc<Store>) -> Self {
+        self.store = Some(store);
+        self
     }
 }
 
@@ -46,7 +58,7 @@ fn is_openai(path: &str) -> bool {
 
 pub fn router(state: Arc<State>) -> Router {
     // Every path is forwarded, so /v1/messages, /v1/messages/count_tokens, etc. all work.
-    Router::new().fallback(proxy).with_state(state)
+    Router::new().merge(crate::api::routes()).fallback(proxy).with_state(state)
 }
 
 const HOP_BY_HOP: &[&str] = &[
@@ -76,6 +88,14 @@ async fn proxy(AxState(st): AxState<Arc<State>>, req: Request) -> Response {
     // Session resolution is best-effort and never affects forwarding.
     let hdr = parts.headers.get(SESSION_HEADER).and_then(|v| v.to_str().ok());
     let session = resolve_session(hdr, &body);
+
+    // Record the conversation off the request path. Errors never reach the agent.
+    if let (Some(store), Some(sid), Some(provider)) =
+        (st.store.clone(), session.clone(), ingest_provider(&parts.method, parts.uri.path()))
+    {
+        let body = body.clone();
+        tokio::spawn(async move { record(store, provider, sid, body).await });
+    }
 
     let path = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
     let base = if is_openai(parts.uri.path()) { &st.openai } else { &st.anthropic };
@@ -124,4 +144,30 @@ fn error(status: StatusCode, msg: &str) -> Response {
         .header(header::CONTENT_TYPE, "text/plain")
         .body(Body::from(msg.to_string()))
         .unwrap()
+}
+
+/// Only chat requests carry a conversation worth recording.
+fn ingest_provider(method: &axum::http::Method, path: &str) -> Option<Provider> {
+    if method != axum::http::Method::POST {
+        return None;
+    }
+    match path {
+        "/v1/messages" => Some(Provider::Anthropic),
+        "/v1/chat/completions" => Some(Provider::OpenAi),
+        _ => None,
+    }
+}
+
+async fn record(store: Arc<Store>, provider: Provider, session: String, body: bytes::Bytes) {
+    let n = match normalize(provider, &body) {
+        Ok(n) => n,
+        Err(e) => return tracing::warn!(%session, error = %e, "skip ingest: unparseable body"),
+    };
+    match store.ingest(&session, provider, n.model.as_deref(), &n.msgs).await {
+        Ok(r) => tracing::info!(
+            %session, turn = r.turn, messages = r.total, new = r.new, missing = r.missing, tokens = r.tokens,
+            "ingested"
+        ),
+        Err(e) => tracing::warn!(%session, error = %e, "ingest failed"),
+    }
 }

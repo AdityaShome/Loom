@@ -20,7 +20,17 @@ async fn main() {
         .parse()
         .expect("LOOM_LISTEN must be host:port");
 
-    let app = gateway::router(Arc::new(gateway::State::new(anthropic.clone(), openai.clone())));
+    let mut state = gateway::State::new(anthropic.clone(), openai.clone());
+    let db = std::env::var("LOOM_DB").unwrap_or_else(|_| "loom.db".into());
+    // Fail open: if the store can't open, keep proxying without recording.
+    match loom_store::Store::open(&db).await {
+        Ok(store) => {
+            tracing::info!(%db, "store ready");
+            state = state.with_store(Arc::new(store));
+        }
+        Err(e) => tracing::error!(%db, error = %e, "store unavailable; proxying without recording"),
+    }
+    let app = gateway::router(Arc::new(state));
     let listener = tokio::net::TcpListener::bind(listen).await.expect("bind");
     tracing::info!(%listen, %anthropic, %openai, "loom listening");
     axum::serve(listener, app)
