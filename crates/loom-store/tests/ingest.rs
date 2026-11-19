@@ -26,8 +26,12 @@ async fn hundred_turn_session_has_one_node_per_unique_message() {
         assert_eq!(r.missing, 0);
         if t % 2 == 0 {
             let id = format!("toolu_{t}");
-            msgs.push(json!({"role":"assistant","content":[{"type":"tool_use","id":id,"name":"Bash","input":{"cmd":"ls"}}]}));
-            msgs.push(json!({"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":"same output"}]}));
+            msgs.push(
+                json!({"role":"assistant","content":[{"type":"tool_use","id":id,"name":"Bash","input":{"cmd":"ls"}}]}),
+            );
+            msgs.push(
+                json!({"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":"same output"}]}),
+            );
         } else {
             // Identical text repeated every odd turn: must still yield distinct nodes.
             msgs.push(json!({"role":"assistant","content":"done"}));

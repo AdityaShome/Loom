@@ -53,7 +53,12 @@ pub async fn enforce(
     });
 
     let mut data = store.policy_data(session).await?.ok_or_else(|| anyhow!("session has no turns"))?;
-    ensure!(data.input.nodes.len() == norm.msgs.len(), "stored nodes ({}) do not match the request ({})", data.input.nodes.len(), norm.msgs.len());
+    ensure!(
+        data.input.nodes.len() == norm.msgs.len(),
+        "stored nodes ({}) do not match the request ({})",
+        data.input.nodes.len(),
+        norm.msgs.len()
+    );
     ensure!(
         data.input.nodes.iter().zip(&norm.msgs).all(|(n, m)| n.kind == m.kind),
         "stored nodes do not line up with the request"
@@ -70,7 +75,9 @@ pub async fn enforce(
             .iter()
             .enumerate()
             .filter(|(i, it)| {
-                it.decision == Action::Summarize && data.input.nodes[*i].kind != NodeKind::ToolCall && !data.summaries.contains_key(&it.id)
+                it.decision == Action::Summarize
+                    && data.input.nodes[*i].kind != NodeKind::ToolCall
+                    && !data.summaries.contains_key(&it.id)
             })
             .map(|(i, _)| i)
             .collect();
@@ -125,18 +132,31 @@ pub async fn enforce(
 
     if summarized == 0 && dropped == 0 {
         store.record_enforced(session, ingested.turn, &decisions, ingested.tokens).await?;
-        return Ok(Enforced { body: None, original_tokens: ingested.tokens, sent_tokens: ingested.tokens, summarized, dropped });
+        return Ok(Enforced {
+            body: None,
+            original_tokens: ingested.tokens,
+            sent_tokens: ingested.tokens,
+            summarized,
+            dropped,
+        });
     }
 
     let original: Value = serde_json::from_slice(body)?;
-    let rewritten = rewrite(provider, &original, &norm.msgs, &plan, &data.summaries).map_err(|e| anyhow!("rewrite failed: {e}"))?;
+    let rewritten =
+        rewrite(provider, &original, &norm.msgs, &plan, &data.summaries).map_err(|e| anyhow!("rewrite failed: {e}"))?;
     validate_request(provider, &rewritten).map_err(|e| anyhow!("rewritten request is invalid: {e}"))?;
     let bytes = Bytes::from(serde_json::to_vec(&rewritten)?);
     if bytes.len() >= body.len() {
         bail!("rewritten request is not smaller ({} >= {} bytes)", bytes.len(), body.len());
     }
     store.record_enforced(session, ingested.turn, &decisions, plan.planned_tokens).await?;
-    Ok(Enforced { body: Some(bytes), original_tokens: ingested.tokens, sent_tokens: plan.planned_tokens, summarized, dropped })
+    Ok(Enforced {
+        body: Some(bytes),
+        original_tokens: ingested.tokens,
+        sent_tokens: plan.planned_tokens,
+        summarized,
+        dropped,
+    })
 }
 
 /// Generate summaries the plan will want, ahead of time (Suggest mode: so they
@@ -148,7 +168,9 @@ pub async fn prefetch(store: Arc<Store>, summarizer: Arc<Summarizer>, session: S
         .items
         .iter()
         .zip(&data.input.nodes)
-        .filter(|(it, n)| it.decision == Action::Summarize && n.kind != NodeKind::ToolCall && !data.summaries.contains_key(&it.id))
+        .filter(|(it, n)| {
+            it.decision == Action::Summarize && n.kind != NodeKind::ToolCall && !data.summaries.contains_key(&it.id)
+        })
         .map(|(_, n)| n.clone())
         .collect();
     for node in wanted {

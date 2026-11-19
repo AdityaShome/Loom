@@ -275,7 +275,13 @@ mod tests {
             .msgs
             .iter()
             .zip(&ids)
-            .map(|(m, id)| GNode { id, kind: m.kind, source: m.source.as_deref(), tool_id: m.tool_id.as_deref(), text: Some(&m.content) })
+            .map(|(m, id)| GNode {
+                id,
+                kind: m.kind,
+                source: m.source.as_deref(),
+                tool_id: m.tool_id.as_deref(),
+                text: Some(&m.content),
+            })
             .collect();
         let all: HashSet<&str> = ids.iter().map(String::as_str).collect();
         let edges = build_edges(&gn, &all);
@@ -312,7 +318,8 @@ mod tests {
         };
         let p = plan(&inp);
         assert_eq!(validate_plan(&inp, &p), Ok(()));
-        let summaries: HashMap<String, String> = p.items.iter().map(|i| (i.id.clone(), format!("short {}", i.id))).collect();
+        let summaries: HashMap<String, String> =
+            p.items.iter().map(|i| (i.id.clone(), format!("short {}", i.id))).collect();
         let out = rewrite(provider, body, &n.msgs, &p, &summaries);
         (p, out, n.msgs)
     }
@@ -326,9 +333,9 @@ mod tests {
                 {"type": "tool_use", "id": "b", "name": "Read", "input": {"file_path": "/r/b.rs"}}]},
             {"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "a", "content": "fn a() {}
-".repeat(40)},
+        ".repeat(40)},
                 {"type": "tool_result", "tool_use_id": "b", "content": "fn b() {}
-".repeat(40)}]},
+        ".repeat(40)}]},
             {"role": "assistant", "content": "done"},
             {"role": "user", "content": "thanks"}
         ]})
@@ -343,7 +350,9 @@ mod tests {
         let body = anthropic_body();
         assert_eq!(validate_request(Provider::Anthropic, &body), Ok(()));
         // Force-drop everything touching a.rs (its call and result).
-        let (_, out, _) = pipeline(Provider::Anthropic, &body, 100_000, &|_, m| (m.source.as_deref() == Some("/r/a.rs")).then_some(Action::Drop));
+        let (_, out, _) = pipeline(Provider::Anthropic, &body, 100_000, &|_, m| {
+            (m.source.as_deref() == Some("/r/a.rs")).then_some(Action::Drop)
+        });
         let out = out.unwrap();
         assert_eq!(validate_request(Provider::Anthropic, &out), Ok(()));
         let s = out.to_string();
@@ -356,7 +365,8 @@ mod tests {
     #[test]
     fn dropping_all_blocks_removes_the_whole_message() {
         let body = anthropic_body();
-        let (_, out, _) = pipeline(Provider::Anthropic, &body, 100_000, &|_, m| m.tool_id.is_some().then_some(Action::Drop));
+        let (_, out, _) =
+            pipeline(Provider::Anthropic, &body, 100_000, &|_, m| m.tool_id.is_some().then_some(Action::Drop));
         let out = out.unwrap();
         assert_eq!(validate_request(Provider::Anthropic, &out), Ok(()));
         // The tool-result message vanished entirely; the assistant message kept its text block.
@@ -413,20 +423,27 @@ mod tests {
             {"role": "assistant", "content": "done"},
             {"role": "user", "content": "thanks"}]});
         assert_eq!(validate_request(Provider::OpenAi, &body), Ok(()));
-        let (_, out, _) = pipeline(Provider::OpenAi, &body, 100_000, &|_, m| (m.source.as_deref() == Some("/r/a.rs") || m.source.as_deref() == Some("read_file") && m.content.contains("a.rs")).then_some(Action::Drop));
+        let (_, out, _) = pipeline(Provider::OpenAi, &body, 100_000, &|_, m| {
+            (m.source.as_deref() == Some("/r/a.rs")
+                || m.source.as_deref() == Some("read_file") && m.content.contains("a.rs"))
+            .then_some(Action::Drop)
+        });
         let out = out.unwrap();
         assert_eq!(validate_request(Provider::OpenAi, &out), Ok(()));
         let s = out.to_string();
         assert!(!s.contains("\"c1\"") && s.contains("\"c2\""), "{s}");
 
         // Dropping every call removes the empty assistant message too.
-        let (_, out, _) = pipeline(Provider::OpenAi, &body, 100_000, &|_, m| m.tool_id.is_some().then_some(Action::Drop));
+        let (_, out, _) =
+            pipeline(Provider::OpenAi, &body, 100_000, &|_, m| m.tool_id.is_some().then_some(Action::Drop));
         let out = out.unwrap();
         assert_eq!(validate_request(Provider::OpenAi, &out), Ok(()));
         assert_eq!(out["messages"].as_array().unwrap().len(), 4); // system, user, "done", user
 
         // Summarizing results replaces tool message content only.
-        let (_, out, _) = pipeline(Provider::OpenAi, &body, 100_000, &|_, m| (m.kind == NodeKind::File || m.kind == NodeKind::ToolResult).then_some(Action::Summarize));
+        let (_, out, _) = pipeline(Provider::OpenAi, &body, 100_000, &|_, m| {
+            (m.kind == NodeKind::File || m.kind == NodeKind::ToolResult).then_some(Action::Summarize)
+        });
         let out = out.unwrap();
         assert_eq!(validate_request(Provider::OpenAi, &out), Ok(()));
         assert!(out.to_string().contains("[loom summary of 1 item]"));
@@ -493,7 +510,8 @@ mod tests {
     }
 
     fn openai_conversation(turns: &[Turn]) -> Value {
-        let mut msgs = vec![json!({"role": "system", "content": "sys"}), json!({"role": "user", "content": "start the task"})];
+        let mut msgs =
+            vec![json!({"role": "system", "content": "sys"}), json!({"role": "user", "content": "start the task"})];
         for (ti, t) in turns.iter().enumerate() {
             match t {
                 Turn::Chat(s) => {
@@ -508,7 +526,9 @@ mod tests {
                         .collect();
                     msgs.push(json!({"role": "assistant", "content": null, "tool_calls": tcs}));
                     for (k, (_, len)) in calls.iter().enumerate() {
-                        msgs.push(json!({"role": "tool", "tool_call_id": format!("c{ti}_{k}"), "content": "x".repeat(*len)}));
+                        msgs.push(
+                            json!({"role": "tool", "tool_call_id": format!("c{ti}_{k}"), "content": "x".repeat(*len)}),
+                        );
                     }
                 }
             }

@@ -40,11 +40,7 @@ pub fn occurrences(hashes: &[[u8; 32]]) -> Vec<u32> {
         .collect()
 }
 
-pub fn match_nodes(
-    hashes: &[[u8; 32]],
-    occs: &[u32],
-    existing: &HashMap<([u8; 32], u32), String>,
-) -> Vec<Match> {
+pub fn match_nodes(hashes: &[[u8; 32]], occs: &[u32], existing: &HashMap<([u8; 32], u32), String>) -> Vec<Match> {
     hashes
         .iter()
         .zip(occs)
@@ -71,7 +67,15 @@ mod tests {
     use crate::model::{NodeKind, Role};
 
     fn m(content: &str) -> CanonMsg {
-        CanonMsg { role: Role::User, kind: NodeKind::User, content: content.into(), source: None, tool_id: None, loc: crate::model::Loc::System, opaque: false }
+        CanonMsg {
+            role: Role::User,
+            kind: NodeKind::User,
+            content: content.into(),
+            source: None,
+            tool_id: None,
+            loc: crate::model::Loc::System,
+            opaque: false,
+        }
     }
 
     #[test]

@@ -25,9 +25,6 @@ pub fn serve(uri: &Uri) -> Option<Response> {
 }
 
 pub fn not_built() -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        "loom: web UI not built. Run `npm install && npm run build` in ui/ and rebuild.",
-    )
+    (StatusCode::NOT_FOUND, "loom: web UI not built. Run `npm install && npm run build` in ui/ and rebuild.")
         .into_response()
 }

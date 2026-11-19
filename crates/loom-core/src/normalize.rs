@@ -85,13 +85,19 @@ fn anthropic(v: &Value) -> Option<Vec<CanonMsg>> {
                             }
                         }
                         Some("tool_use") => {
-                            let mut c = msg(role, NodeKind::ToolCall, b.get("input").map(Value::to_string).unwrap_or_default(), loc);
+                            let mut c = msg(
+                                role,
+                                NodeKind::ToolCall,
+                                b.get("input").map(Value::to_string).unwrap_or_default(),
+                                loc,
+                            );
                             c.source = b.get("name").and_then(Value::as_str).map(String::from);
                             c.tool_id = b.get("id").and_then(Value::as_str).map(String::from);
                             out.push(c);
                         }
                         Some("tool_result") => {
-                            let mut c = msg(role, NodeKind::ToolResult, b.get("content").map(text_of).unwrap_or_default(), loc);
+                            let mut c =
+                                msg(role, NodeKind::ToolResult, b.get("content").map(text_of).unwrap_or_default(), loc);
                             c.tool_id = b.get("tool_use_id").and_then(Value::as_str).map(String::from);
                             // A tool result carrying images/documents cannot be replaced by text safely.
                             c.opaque = b.get("content").and_then(Value::as_array).is_some_and(|a| {
@@ -220,10 +226,7 @@ mod tests {
         let n = normalize(Provider::Anthropic, body).unwrap();
         assert_eq!(n.model.as_deref(), Some("m"));
         let kinds: Vec<_> = n.msgs.iter().map(|m| m.kind).collect();
-        assert_eq!(
-            kinds,
-            [NodeKind::System, NodeKind::User, NodeKind::Assistant, NodeKind::ToolCall, NodeKind::File]
-        );
+        assert_eq!(kinds, [NodeKind::System, NodeKind::User, NodeKind::Assistant, NodeKind::ToolCall, NodeKind::File]);
         assert_eq!(n.msgs[0].content, "sys");
         assert_eq!(n.msgs[4].source.as_deref(), Some("src/a.rs"));
         assert_eq!(n.msgs[4].content, "fn a(){}");

@@ -32,7 +32,16 @@ pub struct Weights {
 
 impl Default for Weights {
     fn default() -> Self {
-        Self { w_imp: 1.0, w_rec: 1.0, w_ref: 0.5, w_task: 1.0, w_sup: 1.5, tau: 8.0, summarize_threshold: 0.8, protect_tail: 4 }
+        Self {
+            w_imp: 1.0,
+            w_rec: 1.0,
+            w_ref: 0.5,
+            w_task: 1.0,
+            w_sup: 1.5,
+            tau: 8.0,
+            summarize_threshold: 0.8,
+            protect_tail: 4,
+        }
     }
 }
 
@@ -51,7 +60,10 @@ pub struct Matcher {
 
 impl Matcher {
     pub fn is_empty(&self) -> bool {
-        self.kind.is_none() && self.source_glob.is_none() && self.min_tokens.is_none() && self.older_than_turns.is_none()
+        self.kind.is_none()
+            && self.source_glob.is_none()
+            && self.min_tokens.is_none()
+            && self.older_than_turns.is_none()
     }
 
     pub fn matches(&self, n: &PNode, age_turns: u32) -> bool {
@@ -59,10 +71,7 @@ impl Matcher {
             && self.kind.is_none_or(|k| k == n.kind)
             && self.min_tokens.is_none_or(|t| n.tokens > t)
             && self.older_than_turns.is_none_or(|t| age_turns > t)
-            && self
-                .source_glob
-                .as_deref()
-                .is_none_or(|g| n.source.as_deref().is_some_and(|s| glob_match(g, s)))
+            && self.source_glob.as_deref().is_none_or(|g| n.source.as_deref().is_some_and(|s| glob_match(g, s)))
     }
 }
 
@@ -234,7 +243,8 @@ pub fn score_nodes(inp: &PolicyInput) -> Vec<f32> {
             _ => {}
         }
     }
-    let query = inp.nodes.iter().rev().find(|n| n.kind == NodeKind::User).map(|n| words(&n.content)).unwrap_or_default();
+    let query =
+        inp.nodes.iter().rev().find(|n| n.kind == NodeKind::User).map(|n| words(&n.content)).unwrap_or_default();
     inp.nodes
         .iter()
         .map(|n| {
@@ -247,7 +257,9 @@ pub fn score_nodes(inp: &PolicyInput) -> Vec<f32> {
                 (words(&n.content).intersection(&query).count() as f32 / query.len() as f32).min(1.0)
             };
             let sup = if superseded.contains(n.id.as_str()) { 1.0 } else { 0.0 };
-            let s = w.w_imp * n.importance.clamp(0.0, 1.0) + w.w_rec * recency + w.w_ref * ref_deg + w.w_task * relevance - w.w_sup * sup;
+            let s =
+                w.w_imp * n.importance.clamp(0.0, 1.0) + w.w_rec * recency + w.w_ref * ref_deg + w.w_task * relevance
+                    - w.w_sup * sup;
             if s.is_finite() {
                 s
             } else {
@@ -340,14 +352,14 @@ pub fn plan(inp: &PolicyInput) -> Plan {
     let mut group_of = vec![0usize; n];
     let mut members: Vec<Vec<usize>> = Vec::new();
     let mut root_group: HashMap<usize, usize> = HashMap::new();
-    for i in 0..n {
+    for (i, slot) in group_of.iter_mut().enumerate() {
         let r = find(&mut parent, i);
         let g = *root_group.entry(r).or_insert_with(|| {
             members.push(Vec::new());
             members.len() - 1
         });
         members[g].push(i);
-        group_of[i] = g;
+        *slot = g;
     }
 
     // Hard constraints (node level).
@@ -440,7 +452,12 @@ pub fn plan(inp: &PolicyInput) -> Plan {
             Action::Drop => 0,
             Action::Summarize => {
                 // Only repeatable when the real summaries still exist.
-                if !grp.can_summarize || grp.members.iter().any(|&i| nodes[i].kind != NodeKind::ToolCall && nodes[i].summary_tokens.is_none()) {
+                if !grp.can_summarize
+                    || grp
+                        .members
+                        .iter()
+                        .any(|&i| nodes[i].kind != NodeKind::ToolCall && nodes[i].summary_tokens.is_none())
+                {
                     return None;
                 }
                 grp.est as u64
@@ -466,15 +483,12 @@ pub fn plan(inp: &PolicyInput) -> Plan {
     // 3. Greedy knapsack on score density for everything left.
     let mut rest: Vec<usize> = (0..groups.len()).filter(|&g| decision[g].is_none()).collect();
     rest.sort_by(|&a, &b| {
-        let (da, db) = (groups[a].score / groups[a].tokens.max(1) as f32, groups[b].score / groups[b].tokens.max(1) as f32);
+        let (da, db) =
+            (groups[a].score / groups[a].tokens.max(1) as f32, groups[b].score / groups[b].tokens.max(1) as f32);
         db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal).then(groups[a].members[0].cmp(&groups[b].members[0]))
     });
-    let superseded_by: HashMap<&str, &str> = inp
-        .edges
-        .iter()
-        .filter(|e| e.kind == EdgeKind::Supersedes)
-        .map(|e| (e.to.as_str(), e.from.as_str()))
-        .collect();
+    let superseded_by: HashMap<&str, &str> =
+        inp.edges.iter().filter(|e| e.kind == EdgeKind::Supersedes).map(|e| (e.to.as_str(), e.from.as_str())).collect();
     for g in rest {
         let grp = &mut groups[g];
         let tokens = grp.tokens as u64;
@@ -491,11 +505,17 @@ pub fn plan(inp: &PolicyInput) -> Plan {
             (Action::Keep, format!("Kept: fits budget (score {:.2})", grp.score))
         } else if grp.can_summarize && used + grp.est as u64 <= budget && grp.score > w.summarize_threshold {
             used += grp.est as u64;
-            (Action::Summarize, format!("Summarized: no room in full; score {:.2} above {:.2}", grp.score, w.summarize_threshold))
+            (
+                Action::Summarize,
+                format!("Summarized: no room in full; score {:.2} above {:.2}", grp.score, w.summarize_threshold),
+            )
         } else if grp.score > w.summarize_threshold {
             (Action::Drop, format!("Dropped: no room even summarized (score {:.2}{sup})", grp.score))
         } else {
-            (Action::Drop, format!("Dropped: score {:.2} below {:.2} and no room{sup}", grp.score, w.summarize_threshold))
+            (
+                Action::Drop,
+                format!("Dropped: score {:.2} below {:.2} and no room{sup}", grp.score, w.summarize_threshold),
+            )
         });
     }
 
@@ -577,7 +597,10 @@ pub fn validate_plan(inp: &PolicyInput, plan: &Plan) -> Result<(), String> {
         return Err("over_budget flag inconsistent".into());
     }
     if !plan.over_budget && plan.planned_tokens > plan.budget {
-        return Err(format!("plan {} exceeds budget {} although the required set fits", plan.planned_tokens, plan.budget));
+        return Err(format!(
+            "plan {} exceeds budget {} although the required set fits",
+            plan.planned_tokens, plan.budget
+        ));
     }
     Ok(())
 }
@@ -631,7 +654,11 @@ mod tests {
 
     #[test]
     fn everything_is_kept_when_it_fits() {
-        let nodes = vec![node("s", NodeKind::System, 10, 0, "sys"), node("u", NodeKind::User, 10, 0, "hi"), node("a", NodeKind::Assistant, 10, 1, "yo")];
+        let nodes = vec![
+            node("s", NodeKind::System, 10, 0, "sys"),
+            node("u", NodeKind::User, 10, 0, "hi"),
+            node("a", NodeKind::Assistant, 10, 1, "yo"),
+        ];
         let inp = input(nodes, vec![], 1000, 1);
         let p = plan(&inp);
         assert!(p.items.iter().all(|i| i.decision == Action::Keep));
@@ -640,7 +667,8 @@ mod tests {
 
     #[test]
     fn low_value_old_bulk_is_dropped_under_pressure() {
-        let mut nodes = vec![node("s", NodeKind::System, 10, 0, "sys"), node("u0", NodeKind::User, 10, 0, "fix the parser")];
+        let mut nodes =
+            vec![node("s", NodeKind::System, 10, 0, "sys"), node("u0", NodeKind::User, 10, 0, "fix the parser")];
         nodes.push(node("log", NodeKind::ToolResult, 5000, 1, "irrelevant noise"));
         nodes.push(node("good", NodeKind::ToolResult, 100, 20, "parser fix details"));
         for i in 0..4 {
@@ -711,7 +739,11 @@ mod tests {
 
     #[test]
     fn missing_summary_falls_back_to_keep_when_it_fits_else_drop() {
-        let mut nodes = vec![node("s", NodeKind::System, 5, 0, "s"), node("u", NodeKind::User, 5, 0, "u"), node("big", NodeKind::ToolResult, 400, 0, "x")];
+        let mut nodes = vec![
+            node("s", NodeKind::System, 5, 0, "s"),
+            node("u", NodeKind::User, 5, 0, "u"),
+            node("big", NodeKind::ToolResult, 400, 0, "x"),
+        ];
         for i in 0..4 {
             nodes.push(node(&format!("t{i}"), NodeKind::Assistant, 5, 10, "t"));
         }
@@ -866,7 +898,12 @@ mod tests {
 
     fn rule() -> impl Strategy<Value = PolicyRule> {
         (
-            proptest::option::of(prop::sample::select(vec![NodeKind::ToolResult, NodeKind::File, NodeKind::Assistant, NodeKind::ToolCall])),
+            proptest::option::of(prop::sample::select(vec![
+                NodeKind::ToolResult,
+                NodeKind::File,
+                NodeKind::Assistant,
+                NodeKind::ToolCall,
+            ])),
             proptest::option::of(0u32..2000),
             proptest::option::of(0u32..10),
             prop::sample::select(vec![Action::Keep, Action::Summarize, Action::Drop]),
@@ -885,11 +922,25 @@ mod tests {
     type Flags = (bool, u8, u8, bool, u16, u8, bool);
 
     /// Build a realistic request: system, user, then random steps, with real graph edges.
-    fn build(steps: &[Step], flags: &[Flags], budget: u32, provider: Provider, rules: Vec<PolicyRule>, tail: usize) -> PolicyInput {
-        let mut nodes = vec![node("n0", NodeKind::System, 40, 0, "system rules"), node("n1", NodeKind::User, 20, 0, "refactor the parser module")];
+    fn build(
+        steps: &[Step],
+        flags: &[Flags],
+        budget: u32,
+        provider: Provider,
+        rules: Vec<PolicyRule>,
+        tail: usize,
+    ) -> PolicyInput {
+        let mut nodes = vec![
+            node("n0", NodeKind::System, 40, 0, "system rules"),
+            node("n1", NodeKind::User, 20, 0, "refactor the parser module"),
+        ];
         let mut meta: Vec<(Option<String>, Option<String>)> = vec![(None, None), (None, None)]; // source, tool_id
         let mut turn = 0u32;
-        let push = |nodes: &mut Vec<PNode>, meta: &mut Vec<(Option<String>, Option<String>)>, mut n: PNode, source: Option<String>, tid: Option<String>| {
+        let push = |nodes: &mut Vec<PNode>,
+                    meta: &mut Vec<(Option<String>, Option<String>)>,
+                    mut n: PNode,
+                    source: Option<String>,
+                    tid: Option<String>| {
             n.id = format!("n{}", nodes.len());
             n.source = source.clone();
             nodes.push(n);
@@ -898,13 +949,33 @@ mod tests {
         for (i, s) in steps.iter().enumerate() {
             turn += (i % 2) as u32;
             match s {
-                Step::User(t) => push(&mut nodes, &mut meta, node("", NodeKind::User, *t, turn, "parser module please"), None, None),
-                Step::Text(t) => push(&mut nodes, &mut meta, node("", NodeKind::Assistant, *t, turn, "working on the parser"), None, None),
+                Step::User(t) => {
+                    push(&mut nodes, &mut meta, node("", NodeKind::User, *t, turn, "parser module please"), None, None)
+                }
+                Step::Text(t) => push(
+                    &mut nodes,
+                    &mut meta,
+                    node("", NodeKind::Assistant, *t, turn, "working on the parser"),
+                    None,
+                    None,
+                ),
                 Step::Tool { file, size } => {
                     let path = format!("/repo/f{file}.rs");
                     let tid = format!("t{i}");
-                    push(&mut nodes, &mut meta, node("", NodeKind::ToolCall, 15, turn, &format!("{{\"file_path\":\"{path}\"}}")), Some("Read".into()), Some(tid.clone()));
-                    push(&mut nodes, &mut meta, node("", NodeKind::File, *size, turn, "file body"), Some(path), Some(tid));
+                    push(
+                        &mut nodes,
+                        &mut meta,
+                        node("", NodeKind::ToolCall, 15, turn, &format!("{{\"file_path\":\"{path}\"}}")),
+                        Some("Read".into()),
+                        Some(tid.clone()),
+                    );
+                    push(
+                        &mut nodes,
+                        &mut meta,
+                        node("", NodeKind::File, *size, turn, "file body"),
+                        Some(path),
+                        Some(tid),
+                    );
                 }
             }
         }
@@ -938,11 +1009,26 @@ mod tests {
         let g: Vec<GNode> = nodes
             .iter()
             .zip(&meta)
-            .map(|(n, (src, tid))| GNode { id: &n.id, kind: n.kind, source: src.as_deref(), tool_id: tid.as_deref(), text: Some(&n.content) })
+            .map(|(n, (src, tid))| GNode {
+                id: &n.id,
+                kind: n.kind,
+                source: src.as_deref(),
+                tool_id: tid.as_deref(),
+                text: Some(&n.content),
+            })
             .collect();
         let all: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
         let edges = build_edges(&g, &all);
-        PolicyInput { nodes, edges, latest_turn: turn, budget, weights: Weights { protect_tail: tail, ..Weights::default() }, rules, provider, no_summary }
+        PolicyInput {
+            nodes,
+            edges,
+            latest_turn: turn,
+            budget,
+            weights: Weights { protect_tail: tail, ..Weights::default() },
+            rules,
+            provider,
+            no_summary,
+        }
     }
 
     fn flags() -> impl Strategy<Value = Flags> {

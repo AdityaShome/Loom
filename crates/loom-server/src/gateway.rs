@@ -50,10 +50,8 @@ pub struct Event {
 impl State {
     pub fn new(anthropic: String, openai: String) -> Self {
         // No automatic decompression or redirects: forward exactly what upstream sends.
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("http client");
+        let client =
+            reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().expect("http client");
         Self {
             client,
             anthropic: anthropic.trim_end_matches('/').to_string(),
@@ -83,9 +81,7 @@ impl State {
 
 /// OpenAI-style endpoints go to the OpenAI upstream; everything else to Anthropic.
 fn is_openai(path: &str) -> bool {
-    ["/v1/chat/", "/v1/completions", "/v1/responses", "/v1/embeddings"]
-        .iter()
-        .any(|p| path.starts_with(p))
+    ["/v1/chat/", "/v1/completions", "/v1/responses", "/v1/embeddings"].iter().any(|p| path.starts_with(p))
 }
 
 pub fn router(state: Arc<State>) -> Router {
@@ -94,8 +90,16 @@ pub fn router(state: Arc<State>) -> Router {
 }
 
 const HOP_BY_HOP: &[&str] = &[
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length",
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+    "content-length",
 ];
 
 fn copy_headers(src: &HeaderMap, dst: &mut HeaderMap, strip_loom: bool) {
@@ -135,7 +139,9 @@ async fn proxy(AxState(st): AxState<Arc<State>>, req: Request) -> Response {
         let creds = Creds::from_headers(provider, &parts.headers);
         let enforcing = matches!(store.session_mode(&sid).await, Ok(Some(m)) if m == "Enforce");
         if enforcing {
-            match crate::enforce::enforce(&store, st.summarizer.as_ref(), &st.events, provider, &sid, &body, &creds).await {
+            match crate::enforce::enforce(&store, st.summarizer.as_ref(), &st.events, provider, &sid, &body, &creds)
+                .await
+            {
                 Ok(done) => {
                     tracing::info!(
                         session = %sid,
@@ -167,14 +173,7 @@ async fn proxy(AxState(st): AxState<Arc<State>>, req: Request) -> Response {
 
     let sent = Instant::now();
     let overhead = sent.duration_since(start);
-    let resp = match st
-        .client
-        .request(parts.method.clone(), &url)
-        .headers(headers)
-        .body(body)
-        .send()
-        .await
-    {
+    let resp = match st.client.request(parts.method.clone(), &url).headers(headers).body(body).send().await {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(error = %e, %url, "upstream request failed");

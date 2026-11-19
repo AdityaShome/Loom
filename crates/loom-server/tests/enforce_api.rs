@@ -92,13 +92,18 @@ fn transcript() -> Value {
     m.push(json!({"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"cmd": "cat build.log"}}]}));
     m.push(json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "noise line\n".repeat(3000)}]}));
     for i in 0..6 {
-        m.push(json!({"role": if i % 2 == 0 {"assistant"} else {"user"}, "content": format!("step {i} on the parser")}));
+        m.push(
+            json!({"role": if i % 2 == 0 {"assistant"} else {"user"}, "content": format!("step {i} on the parser")}),
+        );
     }
     json!({"model": "claude-x", "system": "be brief", "messages": m})
 }
 
 fn node_with_big_result(nodes: &Value) -> String {
-    nodes.as_array().unwrap().iter().find(|n| n["tokens"].as_u64().unwrap() > 1000).unwrap()["id"].as_str().unwrap().to_string()
+    nodes.as_array().unwrap().iter().find(|n| n["tokens"].as_u64().unwrap() > 1000).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 #[tokio::test]
@@ -153,14 +158,13 @@ async fn enforce_fails_open_on_bad_bodies() {
     let e = env(None).await;
     e.send("e", transcript()).await;
     e.put("e", json!({"mode": "Enforce"})).await;
-    let r = e
-        .c
-        .post(format!("{}/v1/messages", e.proxy))
-        .header("x-loom-session", "e")
-        .body("this is not json")
-        .send()
-        .await
-        .unwrap();
+    let r =
+        e.c.post(format!("{}/v1/messages", e.proxy))
+            .header("x-loom-session", "e")
+            .body("this is not json")
+            .send()
+            .await
+            .unwrap();
     assert_eq!(r.status(), 200);
     assert_eq!(e.seen.lock().unwrap().last().unwrap().as_ref(), b"this is not json");
 }

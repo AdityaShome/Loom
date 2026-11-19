@@ -53,7 +53,9 @@ impl SummarizerConfig {
         if provider == Provider::OpenAi && model.to_lowercase().contains("qwen3") {
             extra.insert("reasoning_effort".into(), Value::String("none".into()));
         }
-        if let Some(Value::Object(o)) = std::env::var("LOOM_SUMMARIZER_EXTRA").ok().and_then(|v| serde_json::from_str(&v).ok()) {
+        if let Some(Value::Object(o)) =
+            std::env::var("LOOM_SUMMARIZER_EXTRA").ok().and_then(|v| serde_json::from_str(&v).ok())
+        {
             extra.extend(o);
         }
         Some(Self {
@@ -228,7 +230,11 @@ impl Summarizer {
             }
             // No dedicated key: reuse the caller's credentials, but only toward the same provider.
             (None, p) if creds.provider == Some(p) => {
-                for (name, v) in [("authorization", &creds.authorization), ("x-api-key", &creds.x_api_key), ("anthropic-version", &creds.anthropic_version)] {
+                for (name, v) in [
+                    ("authorization", &creds.authorization),
+                    ("x-api-key", &creds.x_api_key),
+                    ("anthropic-version", &creds.anthropic_version),
+                ] {
                     if let Some(v) = v {
                         h.insert(name, v.clone());
                     }

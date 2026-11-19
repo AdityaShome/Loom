@@ -114,10 +114,7 @@ pub struct SessionSettings {
 }
 
 fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
 impl Store {
@@ -409,10 +406,12 @@ impl Store {
     }
 
     pub async fn session_settings(&self, id: &str) -> Result<Option<SessionSettings>> {
-        let Some(r) = sqlx::query("SELECT id, provider, model, budget_tokens, mode, weights, edited_at FROM sessions WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?
+        let Some(r) = sqlx::query(
+            "SELECT id, provider, model, budget_tokens, mode, weights, edited_at FROM sessions WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
         else {
             return Ok(None);
         };
@@ -432,7 +431,11 @@ impl Store {
     pub async fn update_session(&self, id: &str, u: &SessionUpdate) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
         if let Some(b) = u.budget_tokens {
-            sqlx::query("UPDATE sessions SET budget_tokens = ? WHERE id = ?").bind(b).bind(id).execute(&mut *tx).await?;
+            sqlx::query("UPDATE sessions SET budget_tokens = ? WHERE id = ?")
+                .bind(b)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
         }
         if let Some(m) = &u.mode {
             sqlx::query("UPDATE sessions SET mode = ? WHERE id = ?").bind(m).bind(id).execute(&mut *tx).await?;
@@ -444,7 +447,12 @@ impl Store {
                 .execute(&mut *tx)
                 .await?;
         }
-        let n = sqlx::query("UPDATE sessions SET edited_at = ? WHERE id = ?").bind(now_ms()).bind(id).execute(&mut *tx).await?.rows_affected();
+        let n = sqlx::query("UPDATE sessions SET edited_at = ? WHERE id = ?")
+            .bind(now_ms())
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
         tx.commit().await?;
         Ok(n > 0)
     }
@@ -458,15 +466,27 @@ impl Store {
             return Ok(None);
         };
         if let Some(i) = p.importance {
-            sqlx::query("UPDATE nodes SET importance = ? WHERE id = ?").bind(i.clamp(0.0, 1.0) as f64).bind(id).execute(&mut *tx).await?;
+            sqlx::query("UPDATE nodes SET importance = ? WHERE id = ?")
+                .bind(i.clamp(0.0, 1.0) as f64)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
         }
         if let Some(pin) = p.pinned {
             sqlx::query("UPDATE nodes SET pinned = ? WHERE id = ?").bind(pin as i64).bind(id).execute(&mut *tx).await?;
         }
         if let Some(a) = &p.user_action {
-            sqlx::query("UPDATE nodes SET user_action = ? WHERE id = ?").bind(a.map(|a| a.as_str())).bind(id).execute(&mut *tx).await?;
+            sqlx::query("UPDATE nodes SET user_action = ? WHERE id = ?")
+                .bind(a.map(|a| a.as_str()))
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
         }
-        sqlx::query("UPDATE sessions SET edited_at = ? WHERE id = ?").bind(now_ms()).bind(&session).execute(&mut *tx).await?;
+        sqlx::query("UPDATE sessions SET edited_at = ? WHERE id = ?")
+            .bind(now_ms())
+            .bind(&session)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(Some(session))
     }
@@ -479,10 +499,14 @@ impl Store {
     /// Rules for a session: global rules plus that session's own. `None` lists all.
     pub async fn list_rules(&self, session: Option<&str>) -> Result<Vec<PolicyRule>> {
         let rows = match session {
-            Some(s) => sqlx::query("SELECT * FROM rules WHERE session_id IS NULL OR session_id = ? ORDER BY priority DESC, rowid")
+            Some(s) => {
+                sqlx::query(
+                    "SELECT * FROM rules WHERE session_id IS NULL OR session_id = ? ORDER BY priority DESC, rowid",
+                )
                 .bind(s)
                 .fetch_all(&self.pool)
-                .await?,
+                .await?
+            }
             None => sqlx::query("SELECT * FROM rules ORDER BY priority DESC, rowid").fetch_all(&self.pool).await?,
         };
         rows.iter()
@@ -526,7 +550,13 @@ impl Store {
     /// Mark edits as pending: one session, or every session for a global rule.
     async fn touch(&self, session: Option<&str>) -> Result<()> {
         match session {
-            Some(s) => sqlx::query("UPDATE sessions SET edited_at = ? WHERE id = ?").bind(now_ms()).bind(s).execute(&self.pool).await?,
+            Some(s) => {
+                sqlx::query("UPDATE sessions SET edited_at = ? WHERE id = ?")
+                    .bind(now_ms())
+                    .bind(s)
+                    .execute(&self.pool)
+                    .await?
+            }
             None => sqlx::query("UPDATE sessions SET edited_at = ?").bind(now_ms()).execute(&self.pool).await?,
         };
         Ok(())
@@ -548,8 +578,10 @@ impl Store {
     /// summaries, and what was sent for each node last call.
     pub async fn policy_data(&self, session_id: &str) -> Result<Option<PolicyData>> {
         let Some(settings) = self.session_settings(session_id).await? else { return Ok(None) };
-        let latest: Option<i64> =
-            sqlx::query_scalar("SELECT MAX(idx) FROM turns WHERE session_id = ?").bind(session_id).fetch_one(&self.pool).await?;
+        let latest: Option<i64> = sqlx::query_scalar("SELECT MAX(idx) FROM turns WHERE session_id = ?")
+            .bind(session_id)
+            .fetch_one(&self.pool)
+            .await?;
         let Some(latest) = latest else { return Ok(None) };
 
         let nodes: Vec<Node> = sqlx::query(
@@ -666,13 +698,15 @@ impl Store {
     }
 
     pub async fn put_summary(&self, hash: &[u8; 32], summary: &str, tokens: u32, model: &str) -> Result<()> {
-        sqlx::query("INSERT OR REPLACE INTO summaries_cache (content_hash, summary, tokens, model) VALUES (?, ?, ?, ?)")
-            .bind(hash.as_slice())
-            .bind(summary)
-            .bind(tokens as i64)
-            .bind(model)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "INSERT OR REPLACE INTO summaries_cache (content_hash, summary, tokens, model) VALUES (?, ?, ?, ?)",
+        )
+        .bind(hash.as_slice())
+        .bind(summary)
+        .bind(tokens as i64)
+        .bind(model)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -708,7 +742,11 @@ impl Store {
                 Action::Summarize => Status::Summarized,
                 Action::Drop => Status::Dropped,
             };
-            sqlx::query("UPDATE nodes SET status = ? WHERE id = ?").bind(status.as_str()).bind(id).execute(&mut *tx).await?;
+            sqlx::query("UPDATE nodes SET status = ? WHERE id = ?")
+                .bind(status.as_str())
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
         }
         tx.commit().await?;
         Ok(())

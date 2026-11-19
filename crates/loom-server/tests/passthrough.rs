@@ -29,8 +29,8 @@ async fn fake_upstream(headers: HeaderMap, req: Request) -> Response {
     assert_eq!(body.as_ref(), b"{\"messages\":[]}");
     assert_eq!(headers.get("x-api-key").unwrap(), "sk-test");
     assert!(headers.get("x-loom-session").is_none(), "loom header must not leak upstream");
-    let stream = futures_util::stream::iter(SSE.iter().map(|c| Ok::<_, std::io::Error>(Bytes::from(*c))))
-        .then(|c| async {
+    let stream =
+        futures_util::stream::iter(SSE.iter().map(|c| Ok::<_, std::io::Error>(Bytes::from(*c)))).then(|c| async {
             tokio::time::sleep(Duration::from_millis(20)).await;
             c
         });
@@ -67,7 +67,9 @@ async fn streams_byte_identical_and_passes_headers() {
 
 #[tokio::test]
 async fn upstream_down_returns_502() {
-    let proxy = serve(gateway::router(Arc::new(gateway::State::new("http://127.0.0.1:1".into(), "http://127.0.0.1:1".into())))).await;
+    let proxy =
+        serve(gateway::router(Arc::new(gateway::State::new("http://127.0.0.1:1".into(), "http://127.0.0.1:1".into()))))
+            .await;
     let resp = reqwest::Client::new().post(format!("{proxy}/v1/messages")).body("{}").send().await.unwrap();
     assert_eq!(resp.status(), 502);
 }
@@ -146,11 +148,13 @@ async fn serves_turns_diff_and_ui_shell() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    let turns: Vec<serde_json::Value> = c.get(format!("{proxy}/api/sessions/d/turns")).send().await.unwrap().json().await.unwrap();
+    let turns: Vec<serde_json::Value> =
+        c.get(format!("{proxy}/api/sessions/d/turns")).send().await.unwrap().json().await.unwrap();
     assert_eq!(turns.len(), 2);
     assert_eq!(turns[1]["nodes"], 3);
 
-    let diff: serde_json::Value = c.get(format!("{proxy}/api/sessions/d/diff/0/1")).send().await.unwrap().json().await.unwrap();
+    let diff: serde_json::Value =
+        c.get(format!("{proxy}/api/sessions/d/diff/0/1")).send().await.unwrap().json().await.unwrap();
     assert_eq!(diff["added"].as_array().unwrap().len(), 2); // assistant + 2nd user (distinct occurrence)
     assert_eq!(diff["removed"].as_array().unwrap().len(), 0);
     assert_eq!(c.get(format!("{proxy}/api/sessions/d/diff/0/9")).send().await.unwrap().status(), 404);
@@ -173,14 +177,20 @@ async fn graph_endpoint_returns_nodes_and_edges() {
         {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"cmd": "ls"}}]},
         {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "a b"}]}
     ]);
-    c.post(format!("{proxy}/v1/messages")).header("x-loom-session", "g").body(serde_json::json!({"messages": msgs}).to_string()).send().await.unwrap();
+    c.post(format!("{proxy}/v1/messages"))
+        .header("x-loom-session", "g")
+        .body(serde_json::json!({"messages": msgs}).to_string())
+        .send()
+        .await
+        .unwrap();
     for _ in 0..50 {
         if store.turn_count("g").await.unwrap() == 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let g: serde_json::Value = c.get(format!("{proxy}/api/sessions/g/graph")).send().await.unwrap().json().await.unwrap();
+    let g: serde_json::Value =
+        c.get(format!("{proxy}/api/sessions/g/graph")).send().await.unwrap().json().await.unwrap();
     assert_eq!(g["nodes"].as_array().unwrap().len(), 3);
     let edges = g["edges"].as_array().unwrap();
     assert_eq!(edges.iter().filter(|e| e["kind"] == "ToolPair").count(), 1);

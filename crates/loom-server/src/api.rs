@@ -189,10 +189,10 @@ async fn plan(AxState(st): AxState<Arc<State>>, Path(id): Path<String>) -> Respo
             budget_is_default: settings.budget_tokens <= 0,
             weights: inp.weights,
             pending_changes: store.pending_changes(&id).await?,
-            summarizer: st.summarizer.as_ref().map(|s| SummarizerInfo {
-                model: s.cfg.model.clone(),
-                provider: format!("{:?}", s.cfg.provider),
-            }),
+            summarizer: st
+                .summarizer
+                .as_ref()
+                .map(|s| SummarizerInfo { model: s.cfg.model.clone(), provider: format!("{:?}", s.cfg.provider) }),
         }))
     }
     .await;
@@ -203,7 +203,11 @@ async fn plan(AxState(st): AxState<Arc<State>>, Path(id): Path<String>) -> Respo
     }
 }
 
-async fn update_session(AxState(st): AxState<Arc<State>>, Path(id): Path<String>, Json(u): Json<SessionUpdate>) -> Response {
+async fn update_session(
+    AxState(st): AxState<Arc<State>>,
+    Path(id): Path<String>,
+    Json(u): Json<SessionUpdate>,
+) -> Response {
     let Some(store) = &st.store else { return unavailable() };
     match u.mode.as_deref() {
         None | Some("Observe") | Some("Suggest") | Some("Enforce") => {}
@@ -260,7 +264,10 @@ struct RuleQuery {
     session: Option<String>,
 }
 
-async fn list_rules(AxState(st): AxState<Arc<State>>, axum::extract::Query(q): axum::extract::Query<RuleQuery>) -> Response {
+async fn list_rules(
+    AxState(st): AxState<Arc<State>>,
+    axum::extract::Query(q): axum::extract::Query<RuleQuery>,
+) -> Response {
     let Some(store) = &st.store else { return unavailable() };
     match store.list_rules(q.session.as_deref()).await {
         Ok(r) => Json(r).into_response(),
@@ -333,11 +340,8 @@ async fn match_rule(AxState(st): AxState<Arc<State>>, Path(id): Path<String>, Js
     let Some(store) = &st.store else { return unavailable() };
     match store.policy_input(&id).await {
         Ok(Some(inp)) => {
-            let hits: Vec<_> = inp
-                .nodes
-                .iter()
-                .filter(|n| m.matches(n, inp.latest_turn.saturating_sub(n.first_seen_turn)))
-                .collect();
+            let hits: Vec<_> =
+                inp.nodes.iter().filter(|n| m.matches(n, inp.latest_turn.saturating_sub(n.first_seen_turn))).collect();
             Json(MatchResult {
                 count: hits.len(),
                 tokens: hits.iter().map(|n| n.tokens).sum(),

@@ -35,11 +35,8 @@ fn is_result(k: NodeKind) -> bool {
 
 /// tool call -> its result, matched by tool id. A hard constraint for the policy engine.
 pub fn link_tool_pairs(nodes: &[GNode]) -> Vec<Edge> {
-    let calls: HashMap<&str, &str> = nodes
-        .iter()
-        .filter(|n| n.kind == NodeKind::ToolCall)
-        .filter_map(|n| Some((n.tool_id?, n.id)))
-        .collect();
+    let calls: HashMap<&str, &str> =
+        nodes.iter().filter(|n| n.kind == NodeKind::ToolCall).filter_map(|n| Some((n.tool_id?, n.id))).collect();
     nodes
         .iter()
         .filter(|n| is_result(n.kind))
@@ -78,9 +75,12 @@ pub fn extract_refs(text: &str) -> Vec<String> {
             continue;
         }
         let norm = normalize_path(tok);
-        let has_ext = norm
-            .rsplit_once('.')
-            .is_some_and(|(name, ext)| !name.is_empty() && (1..=6).contains(&ext.len()) && ext.chars().any(|c| c.is_alphabetic()) && ext.chars().all(|c| c.is_alphanumeric()));
+        let has_ext = norm.rsplit_once('.').is_some_and(|(name, ext)| {
+            !name.is_empty()
+                && (1..=6).contains(&ext.len())
+                && ext.chars().any(|c| c.is_alphabetic())
+                && ext.chars().all(|c| c.is_alphanumeric())
+        });
         if (norm.contains('/') || has_ext) && !out.contains(&norm) {
             out.push(norm);
         }
@@ -93,7 +93,9 @@ fn strip_line_suffix(tok: &str) -> &str {
     let mut t = tok;
     for _ in 0..2 {
         match t.rsplit_once(':') {
-            Some((head, tail)) if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) && !head.is_empty() => t = head,
+            Some((head, tail)) if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) && !head.is_empty() => {
+                t = head
+            }
             _ => break,
         }
     }
@@ -186,7 +188,13 @@ mod tests {
     use super::*;
     use NodeKind::*;
 
-    fn n<'a>(id: &'a str, kind: NodeKind, source: Option<&'a str>, tool_id: Option<&'a str>, text: Option<&'a str>) -> GNode<'a> {
+    fn n<'a>(
+        id: &'a str,
+        kind: NodeKind,
+        source: Option<&'a str>,
+        tool_id: Option<&'a str>,
+        text: Option<&'a str>,
+    ) -> GNode<'a> {
         GNode { id, kind, source, tool_id, text }
     }
 
@@ -260,7 +268,10 @@ mod tests {
         ];
         let all: HashSet<&str> = t.iter().map(|x| x.id).collect();
         assert!(link_refers_to(&t, &all).is_empty(), "node cannot refer forward");
-        let t2 = vec![n("f", File, Some("/repo/src/a.rs"), None, None), n("as", Assistant, None, None, Some("nothing about it, see b.rs"))];
+        let t2 = vec![
+            n("f", File, Some("/repo/src/a.rs"), None, None),
+            n("as", Assistant, None, None, Some("nothing about it, see b.rs")),
+        ];
         let all2: HashSet<&str> = t2.iter().map(|x| x.id).collect();
         assert!(link_refers_to(&t2, &all2).is_empty());
     }

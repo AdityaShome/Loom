@@ -5,16 +5,14 @@ use std::{net::SocketAddr, sync::Arc};
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "loom_server=info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "loom_server=info".into()),
         )
         .init();
 
     let anthropic = std::env::var("LOOM_ANTHROPIC_UPSTREAM")
         .or_else(|_| std::env::var("LOOM_UPSTREAM"))
         .unwrap_or_else(|_| "https://api.anthropic.com".into());
-    let openai =
-        std::env::var("LOOM_OPENAI_UPSTREAM").unwrap_or_else(|_| "https://api.openai.com".into());
+    let openai = std::env::var("LOOM_OPENAI_UPSTREAM").unwrap_or_else(|_| "https://api.openai.com".into());
     let listen: SocketAddr = std::env::var("LOOM_LISTEN")
         .unwrap_or_else(|_| "127.0.0.1:7070".into())
         .parse()
@@ -32,7 +30,9 @@ async fn main() {
                     tracing::info!(model = %cfg.model, url = %cfg.url, provider = ?cfg.provider, "summarizer enabled");
                     state = state.with_summarizer(cfg);
                 }
-                None => tracing::info!("no summarizer configured (set LOOM_SUMMARIZER_MODEL); Enforce can only keep or drop"),
+                None => tracing::info!(
+                    "no summarizer configured (set LOOM_SUMMARIZER_MODEL); Enforce can only keep or drop"
+                ),
             }
         }
         Err(e) => tracing::error!(%db, error = %e, "store unavailable; proxying without recording"),
