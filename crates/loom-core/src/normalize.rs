@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::model::{CanonMsg, NodeKind, Provider, Role};
+use crate::model::{CanonMsg, Loc, NodeKind, Provider, Role};
 
 pub struct Normalized {
     pub model: Option<String>,
@@ -23,8 +23,12 @@ pub fn normalize(provider: Provider, body: &[u8]) -> Result<Normalized, String> 
     Ok(Normalized { model, msgs })
 }
 
-fn msg(role: Role, kind: NodeKind, content: String) -> CanonMsg {
-    CanonMsg { role, kind, content, source: None, tool_id: None }
+fn msg(role: Role, kind: NodeKind, content: String, loc: Loc) -> CanonMsg {
+    CanonMsg { role, kind, content, source: None, tool_id: None, loc, opaque: false }
+}
+
+fn at(msg: usize, block: Option<usize>) -> Loc {
+    Loc::Msg { msg, block }
 }
 
 /// Plain text of a content value; non-text blocks become canonical JSON or a marker.
@@ -56,10 +60,10 @@ fn anthropic(v: &Value) -> Option<Vec<CanonMsg>> {
     if let Some(sys) = v.get("system") {
         let t = text_of(sys);
         if !t.is_empty() {
-            out.push(msg(Role::System, NodeKind::System, t));
+            out.push(msg(Role::System, NodeKind::System, t, Loc::System));
         }
     }
-    for m in messages {
+    for (mi, m) in messages.iter().enumerate() {
         let (role, plain) = match m.get("role").and_then(Value::as_str) {
             Some("assistant") => (Role::Assistant, NodeKind::Assistant),
             _ => (Role::User, NodeKind::User),
@@ -67,39 +71,45 @@ fn anthropic(v: &Value) -> Option<Vec<CanonMsg>> {
         match m.get("content") {
             Some(Value::String(s)) => {
                 if !s.trim().is_empty() {
-                    out.push(msg(role, plain, s.trim().to_string()));
+                    out.push(msg(role, plain, s.trim().to_string(), at(mi, None)));
                 }
             }
             Some(Value::Array(blocks)) => {
-                for b in blocks {
+                for (bi, b) in blocks.iter().enumerate() {
+                    let loc = at(mi, Some(bi));
                     match b.get("type").and_then(Value::as_str) {
                         Some("text") => {
                             let t = b.get("text").and_then(Value::as_str).unwrap_or("").trim();
                             if !t.is_empty() {
-                                out.push(msg(role, plain, t.to_string()));
+                                out.push(msg(role, plain, t.to_string(), loc));
                             }
                         }
                         Some("tool_use") => {
-                            let mut c = msg(
-                                role,
-                                NodeKind::ToolCall,
-                                b.get("input").map(Value::to_string).unwrap_or_default(),
-                            );
+                            let mut c = msg(role, NodeKind::ToolCall, b.get("input").map(Value::to_string).unwrap_or_default(), loc);
                             c.source = b.get("name").and_then(Value::as_str).map(String::from);
                             c.tool_id = b.get("id").and_then(Value::as_str).map(String::from);
                             out.push(c);
                         }
                         Some("tool_result") => {
-                            let mut c = msg(
-                                role,
-                                NodeKind::ToolResult,
-                                b.get("content").map(text_of).unwrap_or_default(),
-                            );
+                            let mut c = msg(role, NodeKind::ToolResult, b.get("content").map(text_of).unwrap_or_default(), loc);
                             c.tool_id = b.get("tool_use_id").and_then(Value::as_str).map(String::from);
+                            // A tool result carrying images/documents cannot be replaced by text safely.
+                            c.opaque = b.get("content").and_then(Value::as_array).is_some_and(|a| {
+                                a.iter().any(|p| p.get("type").and_then(Value::as_str) != Some("text"))
+                            });
                             out.push(c);
                         }
-                        Some("image") => out.push(msg(role, plain, image_marker(b))),
-                        _ => out.push(msg(role, plain, b.to_string())),
+                        Some("image") => {
+                            let mut c = msg(role, plain, image_marker(b), loc);
+                            c.opaque = true;
+                            out.push(c);
+                        }
+                        _ => {
+                            // thinking, redacted_thinking, documents, ...: must be sent back untouched.
+                            let mut c = msg(role, plain, b.to_string(), loc);
+                            c.opaque = true;
+                            out.push(c);
+                        }
                     }
                 }
             }
@@ -112,38 +122,49 @@ fn anthropic(v: &Value) -> Option<Vec<CanonMsg>> {
 fn openai(v: &Value) -> Option<Vec<CanonMsg>> {
     let messages = v.get("messages")?.as_array()?;
     let mut out = Vec::new();
-    for m in messages {
+    for (mi, m) in messages.iter().enumerate() {
         let content = m.get("content").map(text_of).unwrap_or_default();
+        // Parts other than plain text (images, audio) cannot be replaced by a text summary.
+        let rich = m
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|a| a.iter().any(|p| p.get("type").and_then(Value::as_str) != Some("text")));
+        let loc = at(mi, None);
         match m.get("role").and_then(Value::as_str) {
             Some("system") | Some("developer") => {
                 if !content.is_empty() {
-                    out.push(msg(Role::System, NodeKind::System, content));
+                    out.push(msg(Role::System, NodeKind::System, content, loc));
                 }
             }
             Some("assistant") => {
                 if !content.is_empty() {
-                    out.push(msg(Role::Assistant, NodeKind::Assistant, content));
+                    let mut c = msg(Role::Assistant, NodeKind::Assistant, content, loc);
+                    c.opaque = rich;
+                    out.push(c);
                 }
-                for tc in m.get("tool_calls").and_then(Value::as_array).into_iter().flatten() {
+                for (k, tc) in m.get("tool_calls").and_then(Value::as_array).into_iter().flatten().enumerate() {
                     let f = tc.get("function");
                     let args = f.and_then(|f| f.get("arguments")).and_then(Value::as_str).unwrap_or("");
                     let canon = serde_json::from_str::<Value>(args)
                         .map(|v| v.to_string())
                         .unwrap_or_else(|_| args.trim().to_string());
-                    let mut c = msg(Role::Assistant, NodeKind::ToolCall, canon);
+                    let mut c = msg(Role::Assistant, NodeKind::ToolCall, canon, at(mi, Some(k)));
                     c.source = f.and_then(|f| f.get("name")).and_then(Value::as_str).map(String::from);
                     c.tool_id = tc.get("id").and_then(Value::as_str).map(String::from);
                     out.push(c);
                 }
             }
             Some("tool") => {
-                let mut c = msg(Role::Tool, NodeKind::ToolResult, content);
+                let mut c = msg(Role::Tool, NodeKind::ToolResult, content, loc);
                 c.tool_id = m.get("tool_call_id").and_then(Value::as_str).map(String::from);
+                c.opaque = rich;
                 out.push(c);
             }
             _ => {
                 if !content.is_empty() {
-                    out.push(msg(Role::User, NodeKind::User, content));
+                    let mut c = msg(Role::User, NodeKind::User, content, loc);
+                    c.opaque = rich;
+                    out.push(c);
                 }
             }
         }

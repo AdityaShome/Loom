@@ -27,6 +27,13 @@ async fn main() {
         Ok(store) => {
             tracing::info!(%db, "store ready");
             state = state.with_store(Arc::new(store));
+            match loom_server::summarizer::SummarizerConfig::from_env(&anthropic, &openai) {
+                Some(cfg) => {
+                    tracing::info!(model = %cfg.model, url = %cfg.url, provider = ?cfg.provider, "summarizer enabled");
+                    state = state.with_summarizer(cfg);
+                }
+                None => tracing::info!("no summarizer configured (set LOOM_SUMMARIZER_MODEL); Enforce can only keep or drop"),
+            }
         }
         Err(e) => tracing::error!(%db, error = %e, "store unavailable; proxying without recording"),
     }

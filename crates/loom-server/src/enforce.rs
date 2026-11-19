@@ -1,0 +1,159 @@
+//! Enforce mode: plan, summarize, rewrite and validate a request before it is
+//! forwarded. Any failure here means "send the original request".
+
+use std::sync::Arc;
+
+use anyhow::{anyhow, bail, ensure, Result};
+use bytes::Bytes;
+use loom_core::{
+    model::{Action, NodeKind, Provider},
+    normalize::normalize,
+    policy::{plan, validate_plan, PNode},
+    rewrite::{rewrite, validate_request},
+};
+use loom_store::Store;
+use serde_json::Value;
+use tokio::sync::broadcast::Sender;
+
+use crate::{
+    gateway::Event,
+    summarizer::{Creds, Summarizer},
+};
+
+/// What Enforce did to one request.
+#[derive(Debug)]
+pub struct Enforced {
+    /// The rewritten body, or `None` when every node is kept (send the original bytes).
+    pub body: Option<Bytes>,
+    pub original_tokens: u32,
+    pub sent_tokens: u32,
+    pub summarized: usize,
+    pub dropped: usize,
+}
+
+/// Run one request through the full pipeline: ingest, plan, summaries, rewrite, validate.
+pub async fn enforce(
+    store: &Arc<Store>,
+    summarizer: Option<&Arc<Summarizer>>,
+    events: &Sender<Event>,
+    provider: Provider,
+    session: &str,
+    body: &Bytes,
+    creds: &Creds,
+) -> Result<Enforced> {
+    let norm = normalize(provider, body).map_err(|e| anyhow!("unparseable body: {e}"))?;
+    let ingested = store.ingest(session, provider, norm.model.as_deref(), &norm.msgs).await?;
+    let _ = events.send(Event {
+        session: session.to_string(),
+        kind: "turn_completed",
+        turn: ingested.turn,
+        new: ingested.new,
+        missing: ingested.missing,
+        tokens: ingested.tokens,
+    });
+
+    let mut data = store.policy_data(session).await?.ok_or_else(|| anyhow!("session has no turns"))?;
+    ensure!(data.input.nodes.len() == norm.msgs.len(), "stored nodes ({}) do not match the request ({})", data.input.nodes.len(), norm.msgs.len());
+    ensure!(
+        data.input.nodes.iter().zip(&norm.msgs).all(|(n, m)| n.kind == m.kind),
+        "stored nodes do not line up with the request"
+    );
+
+    // Plan; generate summaries for anything the plan wants summarized and does not have yet.
+    // Summaries that are not ready in time continue in the background for the next call.
+    let deadline = summarizer.map(|s| tokio::time::Instant::now() + s.cfg.timeout);
+    let mut final_plan = None;
+    for _ in 0..8 {
+        let p = plan(&data.input);
+        let missing: Vec<usize> = p
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(i, it)| {
+                it.decision == Action::Summarize && data.input.nodes[*i].kind != NodeKind::ToolCall && !data.summaries.contains_key(&it.id)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if missing.is_empty() {
+            final_plan = Some(p);
+            break;
+        }
+        match (summarizer, deadline) {
+            (Some(s), Some(dl)) if tokio::time::Instant::now() < dl => {
+                let jobs = missing.iter().map(|&i| {
+                    let (s, node, creds) = (s.clone(), data.input.nodes[i].clone(), creds.clone());
+                    // Detached: a timeout drops our wait, not the work.
+                    let handle = tokio::spawn(async move { s.summarize(&node, &creds).await });
+                    async move { (i, tokio::time::timeout_at(dl, handle).await) }
+                });
+                for (i, res) in futures_util::future::join_all(jobs).await {
+                    let id = data.input.nodes[i].id.clone();
+                    match res {
+                        Ok(Ok(Ok((text, tokens)))) => {
+                            data.input.nodes[i].summary_tokens = Some(tokens);
+                            data.summaries.insert(id, text);
+                        }
+                        Ok(Ok(Err(e))) => {
+                            tracing::debug!(%session, node = %id, error = %e, "summary unavailable");
+                            data.input.no_summary.insert(id);
+                        }
+                        _ => {
+                            tracing::debug!(%session, node = %id, "summary not ready in time");
+                            data.input.no_summary.insert(id);
+                        }
+                    }
+                }
+            }
+            // No summarizer, or out of time: those nodes can only be kept or dropped.
+            _ => missing.iter().for_each(|&i| {
+                data.input.no_summary.insert(data.input.nodes[i].id.clone());
+            }),
+        }
+    }
+    let plan = final_plan.ok_or_else(|| anyhow!("plan did not settle"))?;
+    validate_plan(&data.input, &plan).map_err(|e| anyhow!("invalid plan: {e}"))?;
+
+    let decisions: Vec<(String, Action)> = plan.items.iter().map(|i| (i.id.clone(), i.decision)).collect();
+    // Tool calls in a summarized pair stay verbatim, so they do not count as summarized.
+    let summarized = plan
+        .items
+        .iter()
+        .zip(&data.input.nodes)
+        .filter(|(i, n)| i.decision == Action::Summarize && n.kind != NodeKind::ToolCall)
+        .count();
+    let dropped = plan.items.iter().filter(|i| i.decision == Action::Drop).count();
+
+    if summarized == 0 && dropped == 0 {
+        store.record_enforced(session, ingested.turn, &decisions, ingested.tokens).await?;
+        return Ok(Enforced { body: None, original_tokens: ingested.tokens, sent_tokens: ingested.tokens, summarized, dropped });
+    }
+
+    let original: Value = serde_json::from_slice(body)?;
+    let rewritten = rewrite(provider, &original, &norm.msgs, &plan, &data.summaries).map_err(|e| anyhow!("rewrite failed: {e}"))?;
+    validate_request(provider, &rewritten).map_err(|e| anyhow!("rewritten request is invalid: {e}"))?;
+    let bytes = Bytes::from(serde_json::to_vec(&rewritten)?);
+    if bytes.len() >= body.len() {
+        bail!("rewritten request is not smaller ({} >= {} bytes)", bytes.len(), body.len());
+    }
+    store.record_enforced(session, ingested.turn, &decisions, plan.planned_tokens).await?;
+    Ok(Enforced { body: Some(bytes), original_tokens: ingested.tokens, sent_tokens: plan.planned_tokens, summarized, dropped })
+}
+
+/// Generate summaries the plan will want, ahead of time (Suggest mode: so they
+/// are ready when you switch to Enforce, and for the next call).
+pub async fn prefetch(store: Arc<Store>, summarizer: Arc<Summarizer>, session: String, creds: Creds) {
+    let Ok(Some(data)) = store.policy_data(&session).await else { return };
+    let p = plan(&data.input);
+    let wanted: Vec<PNode> = p
+        .items
+        .iter()
+        .zip(&data.input.nodes)
+        .filter(|(it, n)| it.decision == Action::Summarize && n.kind != NodeKind::ToolCall && !data.summaries.contains_key(&it.id))
+        .map(|(_, n)| n.clone())
+        .collect();
+    for node in wanted {
+        if let Err(e) = summarizer.summarize(&node, &creds).await {
+            tracing::debug!(%session, node = %node.id, error = %e, "prefetch skipped");
+        }
+    }
+}

@@ -34,6 +34,16 @@ str_enum!(
 );
 str_enum!(Status { Full, Summarized, Dropped, DroppedByAgent });
 
+/// Where a node came from in the request body, so the rewriter can edit it in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Loc {
+    /// The top-level Anthropic `system` field.
+    System,
+    /// `messages[msg]`; `block` is the index within its content blocks
+    /// (Anthropic) or `tool_calls` (OpenAI), `None` for the message's own content.
+    Msg { msg: usize, block: Option<usize> },
+}
+
 /// One context item in provider-neutral form, as produced by `normalize`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CanonMsg {
@@ -45,6 +55,10 @@ pub struct CanonMsg {
     pub source: Option<String>,
     /// `tool_use.id` / `tool_use_id` (Anthropic) or `tool_call_id` (OpenAI).
     pub tool_id: Option<String>,
+    /// Position in the request body (not part of the content hash).
+    pub loc: Loc,
+    /// A block type Loom cannot safely edit (thinking, images, ...): always kept as is.
+    pub opaque: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -65,6 +79,8 @@ pub struct Node {
     pub source: Option<String>,
     pub importance: f32,
     pub pinned: bool,
+    /// Cannot be rewritten (see `CanonMsg::opaque`).
+    pub locked: bool,
     pub user_action: Option<String>,
     pub status: Status,
     pub summary_node: Option<String>,

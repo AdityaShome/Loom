@@ -7,6 +7,7 @@ export type Session = {
   budget_tokens: number;
   turns: number;
   nodes: number;
+  saved_tokens: number;
   created_at: number;
 };
 
@@ -29,7 +30,16 @@ export type NodeRow = {
   preview: string;
 };
 
-export type Turn = { idx: number; request_tokens: number; created_at: number; nodes: number };
+export type Turn = {
+  idx: number;
+  /** Tokens as the agent sent them. */
+  request_tokens: number;
+  /** Tokens the model actually received. */
+  sent_tokens: number;
+  rewritten: boolean;
+  created_at: number;
+  nodes: number;
+};
 export type Diff = { added: string[]; removed: string[] };
 export type EdgeKind = "ToolPair" | "Follows" | "RefersTo" | "Supersedes" | "SummaryOf" | "DerivedFrom";
 export type Edge = { from: string; to: string; kind: EdgeKind; weight: number };
@@ -72,6 +82,7 @@ export type PlanResponse = {
   budget_is_default: boolean;
   weights: Weights;
   pending_changes: boolean;
+  summarizer: { model: string; provider: string } | null;
 };
 export type Matcher = {
   kind?: string | null;

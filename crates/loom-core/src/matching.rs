@@ -71,7 +71,7 @@ mod tests {
     use crate::model::{NodeKind, Role};
 
     fn m(content: &str) -> CanonMsg {
-        CanonMsg { role: Role::User, kind: NodeKind::User, content: content.into(), source: None, tool_id: None }
+        CanonMsg { role: Role::User, kind: NodeKind::User, content: content.into(), source: None, tool_id: None, loc: crate::model::Loc::System, opaque: false }
     }
 
     #[test]

@@ -46,13 +46,19 @@ pub struct SessionRow {
     pub budget_tokens: i64,
     pub turns: i64,
     pub nodes: i64,
+    /// Tokens not sent because Enforce rewrote requests.
+    pub saved_tokens: i64,
     pub created_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TurnRow {
     pub idx: i64,
+    /// Tokens of the request as the agent sent it.
     pub request_tokens: i64,
+    /// Tokens of what the model actually received (smaller when Enforce rewrote it).
+    pub sent_tokens: i64,
+    pub rewritten: bool,
     pub created_at: i64,
     pub nodes: i64,
 }
@@ -79,6 +85,13 @@ where
     T: Deserialize<'de>,
 {
     Ok(Some(Option::deserialize(d)?))
+}
+
+/// Policy input plus the cached summary text for nodes that already have one.
+pub struct PolicyData {
+    pub input: PolicyInput,
+    /// node id -> summary text
+    pub summaries: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -185,9 +198,8 @@ impl Store {
             match mt {
                 Match::Existing(id) => {
                     sqlx::query(
-                        "UPDATE nodes SET last_seen_turn = ?, position = ?,
-                           status = CASE WHEN status = 'DroppedByAgent' THEN 'Full' ELSE status END
-                         WHERE id = ?",
+                        // Status is recomputed every request: Full unless Enforce rewrites it below.
+                        "UPDATE nodes SET last_seen_turn = ?, position = ?, status = 'Full' WHERE id = ?",
                     )
                     .bind(turn)
                     .bind(i as i64)
@@ -200,8 +212,8 @@ impl Store {
                     let id = ulid::Ulid::new().to_string();
                     sqlx::query(
                         "INSERT INTO nodes (id, session_id, content_hash, occ, kind, role, content, tokens,
-                           first_seen_turn, last_seen_turn, position, source)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11)",
+                           first_seen_turn, last_seen_turn, position, source, locked)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12)",
                     )
                     .bind(&id)
                     .bind(session_id)
@@ -214,6 +226,7 @@ impl Store {
                     .bind(turn)
                     .bind(i as i64)
                     .bind(&m.source)
+                    .bind(m.opaque as i64)
                     .execute(&mut *tx)
                     .await?;
                     new += 1;
@@ -251,7 +264,7 @@ impl Store {
         // Nodes we knew about that the agent stopped sending (it compacted or trimmed).
         let missing = sqlx::query(
             "UPDATE nodes SET status = 'DroppedByAgent'
-             WHERE session_id = ? AND last_seen_turn < ? AND status = 'Full'",
+             WHERE session_id = ? AND last_seen_turn < ? AND status != 'DroppedByAgent'",
         )
         .bind(session_id)
         .bind(turn)
@@ -287,7 +300,9 @@ impl Store {
         let rows = sqlx::query(
             "SELECT s.id, s.name, s.provider, s.model, s.mode, s.budget_tokens, s.created_at,
                (SELECT COUNT(*) FROM turns t WHERE t.session_id = s.id) AS turns,
-               (SELECT COUNT(*) FROM nodes n WHERE n.session_id = s.id) AS nodes
+               (SELECT COUNT(*) FROM nodes n WHERE n.session_id = s.id) AS nodes,
+               (SELECT COALESCE(SUM(sn.original_tokens - sn.sent_tokens), 0) FROM snapshots sn
+                  JOIN turns t ON t.id = sn.turn_id WHERE t.session_id = s.id) AS saved_tokens
              FROM sessions s ORDER BY s.created_at DESC",
         )
         .fetch_all(&self.pool)
@@ -303,6 +318,7 @@ impl Store {
                 budget_tokens: r.get("budget_tokens"),
                 turns: r.get("turns"),
                 nodes: r.get("nodes"),
+                saved_tokens: r.get("saved_tokens"),
                 created_at: r.get("created_at"),
             })
             .collect())
@@ -355,7 +371,7 @@ impl Store {
 
     pub async fn list_turns(&self, session_id: &str) -> Result<Vec<TurnRow>> {
         let rows = sqlx::query(
-            "SELECT t.idx, t.request_tokens, t.created_at, sn.sent_node_ids
+            "SELECT t.idx, t.request_tokens, t.created_at, sn.sent_node_ids, sn.sent_tokens, sn.rewritten
              FROM turns t JOIN snapshots sn ON sn.turn_id = t.id
              WHERE t.session_id = ? ORDER BY t.idx",
         )
@@ -368,6 +384,8 @@ impl Store {
                 Ok(TurnRow {
                     idx: r.get("idx"),
                     request_tokens: r.get("request_tokens"),
+                    sent_tokens: r.get("sent_tokens"),
+                    rewritten: r.get::<i64, _>("rewritten") != 0,
                     created_at: r.get("created_at"),
                     nodes: ids.len() as i64,
                 })
@@ -526,8 +544,9 @@ impl Store {
     }
 
     /// Everything the policy needs for the next request of a session: the nodes
-    /// of the latest request (in order), their edges, settings and rules.
-    pub async fn policy_input(&self, session_id: &str) -> Result<Option<PolicyInput>> {
+    /// of the latest request (in order), their edges, settings, rules, cached
+    /// summaries, and what was sent for each node last call.
+    pub async fn policy_data(&self, session_id: &str) -> Result<Option<PolicyData>> {
         let Some(settings) = self.session_settings(session_id).await? else { return Ok(None) };
         let latest: Option<i64> =
             sqlx::query_scalar("SELECT MAX(idx) FROM turns WHERE session_id = ?").bind(session_id).fetch_one(&self.pool).await?;
@@ -552,6 +571,46 @@ impl Store {
             .filter(|e| present.contains(e.from.as_str()) && present.contains(e.to.as_str()))
             .collect();
 
+        // Cached summaries for these nodes (keyed by content hash).
+        let mut summaries: HashMap<String, (String, u32)> = HashMap::new();
+        for r in sqlx::query(
+            "SELECT n.id, s.summary, s.tokens FROM nodes n JOIN summaries_cache s ON s.content_hash = n.content_hash
+             WHERE n.session_id = ? AND n.last_seen_turn = ?",
+        )
+        .bind(session_id)
+        .bind(latest)
+        .fetch_all(&self.pool)
+        .await?
+        {
+            summaries.insert(r.get("id"), (r.get("summary"), r.get::<i64, _>("tokens") as u32));
+        }
+
+        // What the previous call actually sent for each node.
+        let prev: HashMap<String, Action> = if latest == 0 {
+            HashMap::new()
+        } else {
+            let row = sqlx::query(
+                "SELECT sn.decisions, sn.sent_node_ids FROM snapshots sn JOIN turns t ON t.id = sn.turn_id
+                 WHERE t.session_id = ? AND t.idx = ?",
+            )
+            .bind(session_id)
+            .bind(latest - 1)
+            .fetch_optional(&self.pool)
+            .await?;
+            match row {
+                Some(r) => match r.get::<Option<String>, _>("decisions") {
+                    Some(d) => serde_json::from_str::<HashMap<String, Action>>(&d).unwrap_or_default(),
+                    // Nothing was rewritten: every node of that request went out unchanged.
+                    None => serde_json::from_str::<Vec<String>>(r.get::<&str, _>("sent_node_ids"))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|id| (id, Action::Keep))
+                        .collect(),
+                },
+                None => HashMap::new(),
+            }
+        };
+
         let budget = if settings.budget_tokens > 0 {
             settings.budget_tokens.min(u32::MAX as i64) as u32
         } else {
@@ -560,26 +619,99 @@ impl Store {
         let pnodes = nodes
             .into_iter()
             .map(|n| PNode {
+                prev: prev.get(&n.id).copied(),
+                summary_tokens: summaries.get(&n.id).map(|s| s.1),
                 id: n.id,
                 kind: n.kind,
                 content: n.content,
+                content_hash: n.content_hash,
                 tokens: n.tokens,
                 first_seen_turn: n.first_seen_turn,
                 source: n.source,
                 importance: n.importance,
                 pinned: n.pinned,
+                locked: n.locked,
                 user_action: n.user_action.as_deref().and_then(Action::parse),
             })
             .collect();
-        Ok(Some(PolicyInput {
-            nodes: pnodes,
-            edges,
-            latest_turn: latest as u32,
-            budget,
-            weights: settings.weights,
-            rules: self.list_rules(Some(session_id)).await?,
-            provider: settings.provider.as_deref().and_then(Provider::parse).unwrap_or(Provider::Anthropic),
+        Ok(Some(PolicyData {
+            input: PolicyInput {
+                nodes: pnodes,
+                edges,
+                latest_turn: latest as u32,
+                budget,
+                weights: settings.weights,
+                rules: self.list_rules(Some(session_id)).await?,
+                provider: settings.provider.as_deref().and_then(Provider::parse).unwrap_or(Provider::Anthropic),
+                no_summary: Default::default(),
+            },
+            summaries: summaries.into_iter().map(|(k, v)| (k, v.0)).collect(),
         }))
+    }
+
+    pub async fn policy_input(&self, session_id: &str) -> Result<Option<PolicyInput>> {
+        Ok(self.policy_data(session_id).await?.map(|d| d.input))
+    }
+
+    pub async fn session_mode(&self, id: &str) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT mode FROM sessions WHERE id = ?").bind(id).fetch_optional(&self.pool).await?)
+    }
+
+    pub async fn get_summary(&self, hash: &[u8; 32]) -> Result<Option<(String, u32)>> {
+        let r = sqlx::query("SELECT summary, tokens FROM summaries_cache WHERE content_hash = ?")
+            .bind(hash.as_slice())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(r.map(|r| (r.get("summary"), r.get::<i64, _>("tokens") as u32)))
+    }
+
+    pub async fn put_summary(&self, hash: &[u8; 32], summary: &str, tokens: u32, model: &str) -> Result<()> {
+        sqlx::query("INSERT OR REPLACE INTO summaries_cache (content_hash, summary, tokens, model) VALUES (?, ?, ?, ?)")
+            .bind(hash.as_slice())
+            .bind(summary)
+            .bind(tokens as i64)
+            .bind(model)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Record what Enforce actually sent on `turn`: replaces the snapshot's
+    /// "everything" with the kept and summarized nodes, stores the per-node
+    /// decisions, and updates node statuses.
+    pub async fn record_enforced(
+        &self,
+        session_id: &str,
+        turn: u32,
+        decisions: &[(String, Action)],
+        sent_tokens: u32,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let sent_ids: Vec<&str> = decisions.iter().filter(|d| d.1 != Action::Drop).map(|d| d.0.as_str()).collect();
+        let map: HashMap<&str, Action> = decisions.iter().map(|(id, a)| (id.as_str(), *a)).collect();
+        let rewritten = decisions.iter().any(|d| d.1 != Action::Keep);
+        sqlx::query(
+            "UPDATE snapshots SET sent_node_ids = ?, sent_tokens = ?, rewritten = ?, decisions = ?
+             WHERE turn_id = (SELECT id FROM turns WHERE session_id = ? AND idx = ?)",
+        )
+        .bind(serde_json::to_string(&sent_ids)?)
+        .bind(sent_tokens as i64)
+        .bind(rewritten as i64)
+        .bind(if rewritten { Some(serde_json::to_string(&map)?) } else { None })
+        .bind(session_id)
+        .bind(turn as i64)
+        .execute(&mut *tx)
+        .await?;
+        for (id, a) in decisions {
+            let status = match a {
+                Action::Keep => Status::Full,
+                Action::Summarize => Status::Summarized,
+                Action::Drop => Status::Dropped,
+            };
+            sqlx::query("UPDATE nodes SET status = ? WHERE id = ?").bind(status.as_str()).bind(id).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn turn_count(&self, session_id: &str) -> Result<i64> {
@@ -608,6 +740,7 @@ fn node_from_row(r: &SqliteRow) -> Result<Node> {
         source: r.get("source"),
         importance: r.get::<f64, _>("importance") as f32,
         pinned: r.get::<i64, _>("pinned") != 0,
+        locked: r.get::<i64, _>("locked") != 0,
         user_action: r.get("user_action"),
         status: Status::parse(r.get("status")).ok_or_else(|| enum_err("status"))?,
         summary_node: r.get("summary_node"),

@@ -166,6 +166,14 @@ struct PlanResponse {
     weights: Weights,
     /// Edits made since the last model call; they apply to the next one.
     pending_changes: bool,
+    /// The model used for summaries, if one is configured.
+    summarizer: Option<SummarizerInfo>,
+}
+
+#[derive(Serialize)]
+struct SummarizerInfo {
+    model: String,
+    provider: String,
 }
 
 async fn plan(AxState(st): AxState<Arc<State>>, Path(id): Path<String>) -> Response {
@@ -181,6 +189,10 @@ async fn plan(AxState(st): AxState<Arc<State>>, Path(id): Path<String>) -> Respo
             budget_is_default: settings.budget_tokens <= 0,
             weights: inp.weights,
             pending_changes: store.pending_changes(&id).await?,
+            summarizer: st.summarizer.as_ref().map(|s| SummarizerInfo {
+                model: s.cfg.model.clone(),
+                provider: format!("{:?}", s.cfg.provider),
+            }),
         }))
     }
     .await;
@@ -194,9 +206,8 @@ async fn plan(AxState(st): AxState<Arc<State>>, Path(id): Path<String>) -> Respo
 async fn update_session(AxState(st): AxState<Arc<State>>, Path(id): Path<String>, Json(u): Json<SessionUpdate>) -> Response {
     let Some(store) = &st.store else { return unavailable() };
     match u.mode.as_deref() {
-        None | Some("Observe") | Some("Suggest") => {}
-        Some("Enforce") => return bad("Enforce mode is not available yet (it arrives with the rewriter)"),
-        Some(_) => return bad("mode must be Observe or Suggest"),
+        None | Some("Observe") | Some("Suggest") | Some("Enforce") => {}
+        Some(_) => return bad("mode must be Observe, Suggest or Enforce"),
     }
     if u.budget_tokens.is_some_and(|b| b < 0) {
         return bad("budget_tokens must be >= 0 (0 = model default)");

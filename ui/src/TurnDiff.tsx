@@ -42,7 +42,7 @@ export default function TurnDiff({ sessionId, turns, nodes }: { sessionId: strin
   };
   const opts = turns.map((t) => (
     <option key={t.idx} value={t.idx}>
-      Turn {t.idx + 1} · {fmtTokens(t.request_tokens)} tokens
+      Turn {t.idx + 1} · {fmtTokens(t.sent_tokens)} tokens{t.rewritten ? ` (agent sent ${fmtTokens(t.request_tokens)})` : ""}
     </option>
   ));
 
@@ -65,7 +65,8 @@ export default function TurnDiff({ sessionId, turns, nodes }: { sessionId: strin
       </ul>
     );
 
-  const delta = ta && tb ? tb.request_tokens - ta.request_tokens : 0;
+  // What the model saw (after any rewriting), not what the agent sent.
+  const delta = ta && tb ? tb.sent_tokens - ta.sent_tokens : 0;
 
   return (
     <>
@@ -85,7 +86,7 @@ export default function TurnDiff({ sessionId, turns, nodes }: { sessionId: strin
         {picked && <button onClick={() => setPicked(false)}>follow latest</button>}
         {ta && tb && (
           <span className="muted">
-            {fmtTokens(ta.request_tokens)} → {fmtTokens(tb.request_tokens)} tokens ({delta >= 0 ? "+" : "−"}
+            {fmtTokens(ta.sent_tokens)} → {fmtTokens(tb.sent_tokens)} tokens ({delta >= 0 ? "+" : "−"}
             {fmtTokens(Math.abs(delta))})
           </span>
         )}

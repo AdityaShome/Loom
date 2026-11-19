@@ -151,8 +151,7 @@ async fn validation_and_unknowns() {
     let e = env().await;
     e.send("v", transcript()).await;
     let put = |body: Value| e.c.put(format!("{}/api/sessions/v", e.proxy)).json(&body).send();
-    assert_eq!(put(json!({"mode": "Enforce"})).await.unwrap().status(), 400);
-    assert_eq!(put(json!({"mode": "Nope"})).await.unwrap().status(), 400);
+        assert_eq!(put(json!({"mode": "Nope"})).await.unwrap().status(), 400);
     assert_eq!(put(json!({"budget_tokens": -5})).await.unwrap().status(), 400);
     assert_eq!(put(json!({"weights": {"tau": 0.0}})).await.unwrap().status(), 400);
     assert_eq!(e.c.get(format!("{}/api/sessions/nope/plan", e.proxy)).send().await.unwrap().status(), 404);

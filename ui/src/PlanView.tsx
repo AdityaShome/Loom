@@ -33,7 +33,11 @@ export default function PlanView({
 
   const byId = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
   const counts = { Keep: 0, Summarize: 0, Drop: 0 };
-  plan.items.forEach((i) => counts[i.decision]++);
+  // Tool calls in a summarized pair stay verbatim, so only count real summaries.
+  plan.items.forEach((i) => {
+    if (i.decision === "Summarize" && byId.get(i.id)?.kind === "ToolCall") counts.Keep++;
+    else counts[i.decision]++;
+  });
   const saved = plan.original_tokens - plan.planned_tokens;
   const rows = plan.items.filter((i) => !filter || i.decision === filter);
 
@@ -44,6 +48,18 @@ export default function PlanView({
     <>
       {resp.pending_changes && (
         <p className="banner">Pending changes: your edits are in this plan and apply on the next model call.</p>
+      )}
+      {resp.mode === "Enforce" && !resp.summarizer && (
+        <p className="banner">
+          No summarizer configured, so nothing is summarized: nodes are only kept or dropped. Set{" "}
+          <code>LOOM_SUMMARIZER_MODEL</code> (and optionally <code>LOOM_SUMMARIZER_URL</code>) and restart Loom.
+        </p>
+      )}
+      {resp.summarizer && (
+        <p className="muted small">
+          Summaries come from <code>{resp.summarizer.model}</code> ({resp.summarizer.provider}). A summary that is not ready in time is
+          skipped for that call and used on the next one.
+        </p>
       )}
       {plan.over_budget && (
         <p className="banner bad">
@@ -58,9 +74,7 @@ export default function PlanView({
           <select value={resp.mode} onChange={(e) => run(api.updateSession(sessionId, { mode: e.target.value }))}>
             <option value="Observe">Observe</option>
             <option value="Suggest">Suggest</option>
-            <option value="Enforce" disabled>
-              Enforce (not available yet)
-            </option>
+            <option value="Enforce">Enforce</option>
           </select>
         </label>
         <label>
@@ -77,9 +91,11 @@ export default function PlanView({
           {budget ? "Set budget" : "Use model default"}
         </button>
         <span className="muted">
-          {resp.mode === "Suggest"
-            ? "Suggest: this plan is shown here; the original request is still sent."
-            : "Observe: recording only. The plan below is a preview."}
+          {resp.mode === "Enforce"
+            ? "Enforce: each request is rewritten to this plan before it is sent. Anything that fails falls back to the original."
+            : resp.mode === "Suggest"
+              ? "Suggest: this plan is shown here and summaries are prepared; the original request is still sent."
+              : "Observe: recording only. The plan below is a preview."}
         </span>
       </div>
 
@@ -110,9 +126,9 @@ export default function PlanView({
         </div>
       </div>
       <p className="muted small">
-        Summary sizes are estimates until the summarizer exists. Prompt-cache prefix: first {plan.cache_prefix_len} nodes are
-        unchanged since the last call;{" "}
-        {plan.prefix_frozen ? "they are held fixed to protect caching." : "they are not held fixed (nothing to protect, or the budget forces edits)."}
+        Summary sizes are estimates until a summary exists. Prompt-cache prefix: the first {plan.cache_prefix_len} nodes were sent last
+        call;{" "}
+        {plan.prefix_frozen ? "their decisions are repeated so the provider's cache stays valid." : "they are not held fixed (nothing to protect, or the budget forces edits)."}
       </p>
 
       <details className="weights">

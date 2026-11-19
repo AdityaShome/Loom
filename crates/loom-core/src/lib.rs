@@ -5,4 +5,5 @@ pub mod matching;
 pub mod model;
 pub mod normalize;
 pub mod policy;
+pub mod rewrite;
 pub mod session;

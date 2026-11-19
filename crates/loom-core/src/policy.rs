@@ -81,12 +81,19 @@ pub struct PNode {
     pub id: String,
     pub kind: NodeKind,
     pub content: String,
+    pub content_hash: [u8; 32],
     pub tokens: u32,
     pub first_seen_turn: u32,
     pub source: Option<String>,
     pub importance: f32,
     pub pinned: bool,
+    /// Block type that cannot be rewritten (thinking, images, ...): always kept.
+    pub locked: bool,
     pub user_action: Option<Action>,
+    /// Real size of the cached summary of this node, when one exists.
+    pub summary_tokens: Option<u32>,
+    /// What was actually sent for this node last call (`None` = it is new).
+    pub prev: Option<Action>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +105,9 @@ pub struct PolicyInput {
     pub weights: Weights,
     pub rules: Vec<PolicyRule>,
     pub provider: Provider,
+    /// Nodes whose summary is unavailable (not ready in time, or failed): they
+    /// can only be kept or dropped.
+    pub no_summary: HashSet<String>,
 }
 
 // ---------------------------------------------------------------- outputs
@@ -109,7 +119,7 @@ pub struct PlanItem {
     pub reason: String,
     pub score: f32,
     pub tokens: u32,
-    /// Tokens this node costs under the decision (0 dropped, estimate if summarized).
+    /// Tokens this node costs under the decision (0 dropped, summary size if summarized).
     pub planned_tokens: u32,
     /// True when a hard constraint forces the node to stay.
     pub required: bool,
@@ -126,15 +136,34 @@ pub struct Plan {
     /// The floor alone exceeds the budget; everything else is dropped.
     pub over_budget: bool,
     pub cache_prefix_len: usize,
-    /// Unchanged prefix was held fixed to protect prompt caching.
+    /// The previous call's decisions for the unchanged prefix were repeated to protect prompt caching.
     pub prefix_frozen: bool,
 }
 
 // ---------------------------------------------------------------- helpers
 
-/// Summaries do not exist until Phase 6; this estimates their size.
+/// Estimated summary size, used until a real summary exists.
 pub fn summary_estimate(tokens: u32) -> u32 {
     (tokens / 5).clamp(24, 400).min(tokens)
+}
+
+/// Size of a node once summarized. Tool calls are never rewritten (their
+/// arguments stay verbatim), so they do not shrink.
+pub fn node_est(n: &PNode) -> u32 {
+    if n.kind == NodeKind::ToolCall {
+        n.tokens
+    } else {
+        n.summary_tokens.unwrap_or_else(|| summary_estimate(n.tokens)).min(n.tokens)
+    }
+}
+
+/// Tokens a node costs under a decision.
+pub fn planned_cost(n: &PNode, a: Action) -> u32 {
+    match a {
+        Action::Keep => n.tokens,
+        Action::Summarize => node_est(n),
+        Action::Drop => 0,
+    }
 }
 
 /// Default budget: model window minus reserved output tokens.
@@ -182,10 +211,10 @@ fn words(text: &str) -> HashSet<String> {
         .collect()
 }
 
-/// Leading nodes that existed before this turn: the prefix a provider can
-/// serve from its prompt cache if we leave it untouched.
-pub fn cache_prefix_len(nodes: &[PNode], latest_turn: u32) -> usize {
-    nodes.iter().take_while(|n| n.first_seen_turn < latest_turn).count()
+/// Leading nodes that were part of the previous call: the prefix a provider
+/// can serve from its prompt cache if we send it unchanged.
+pub fn cache_prefix_len(nodes: &[PNode]) -> usize {
+    nodes.iter().take_while(|n| n.prev.is_some()).count()
 }
 
 // ---------------------------------------------------------------- scoring
@@ -258,6 +287,14 @@ fn safety(a: Action) -> u8 {
     }
 }
 
+fn verb(a: Action) -> &'static str {
+    match a {
+        Action::Keep => "Kept",
+        Action::Summarize => "Summarized",
+        Action::Drop => "Dropped",
+    }
+}
+
 // ---------------------------------------------------------------- planning
 
 struct Group {
@@ -267,6 +304,9 @@ struct Group {
     score: f32,
     required: Option<String>,
     forced: Option<(Action, String)>,
+    can_summarize: bool,
+    /// Same decision last call for every member, if the whole group existed then.
+    prev: Option<Action>,
     in_prefix: bool,
 }
 
@@ -277,7 +317,7 @@ pub fn plan(inp: &PolicyInput) -> Plan {
     let w = &inp.weights;
     let scores = score_nodes(inp);
     let forced = apply_rules(nodes, inp.latest_turn, &inp.rules);
-    let prefix_len = cache_prefix_len(nodes, inp.latest_turn);
+    let prefix_len = cache_prefix_len(nodes);
     let idx: HashMap<&str, usize> = nodes.iter().enumerate().map(|(i, x)| (x.id.as_str(), i)).collect();
 
     // Tool pairs form groups that always share one decision.
@@ -320,6 +360,8 @@ pub fn plan(inp: &PolicyInput) -> Plan {
             Some("system prompt".into())
         } else if x.pinned {
             Some("pinned".into())
+        } else if x.locked {
+            Some("block type cannot be rewritten".into())
         } else if Some(i) == last_user {
             Some("latest user message".into())
         } else if inp.provider == Provider::Anthropic && Some(i) == first_user {
@@ -337,16 +379,28 @@ pub fn plan(inp: &PolicyInput) -> Plan {
         .into_iter()
         .map(|ms| {
             let tokens: u32 = ms.iter().map(|&i| nodes[i].tokens).sum();
-            let est: u32 = ms.iter().map(|&i| summary_estimate(nodes[i].tokens)).sum();
+            let est: u32 = ms.iter().map(|&i| node_est(&nodes[i])).sum();
             let score = ms.iter().map(|&i| scores[i]).fold(f32::MIN, f32::max);
             let mut required = ms.iter().find_map(|&i| required_reason(i));
             if let (Some(r), true) = (&mut required, ms.len() > 1) {
                 *r = format!("{r} (tool pair stays together)");
             }
+            // A group can be summarized when every member that needs a summary can have one
+            // and the result is actually smaller.
+            let can_summarize = est < tokens
+                && ms.iter().all(|&i| {
+                    let x = &nodes[i];
+                    x.kind == NodeKind::ToolCall || (!inp.no_summary.contains(&x.id) && node_est(x) < x.tokens)
+                });
             // Safest forced action among members wins, so a pair never splits.
             let forced = ms.iter().filter_map(|&i| forced[i].clone()).max_by_key(|(a, _)| safety(*a));
+            let prevs: Vec<Option<Action>> = ms.iter().map(|&i| nodes[i].prev).collect();
+            let prev = match prevs.first().copied().flatten() {
+                Some(p) if prevs.iter().all(|x| *x == Some(p)) => Some(p),
+                _ => None,
+            };
             let in_prefix = ms.iter().any(|&i| i < prefix_len);
-            Group { members: ms, tokens, est, score, required, forced, in_prefix }
+            Group { members: ms, tokens, est, score, required, forced, can_summarize, prev, in_prefix }
         })
         .collect();
 
@@ -354,8 +408,8 @@ pub fn plan(inp: &PolicyInput) -> Plan {
     let mut decision: Vec<Option<(Action, String)>> = vec![None; groups.len()];
     let mut used: u64 = 0;
 
-    // 1. Required groups and forced summaries.
-    for (g, grp) in groups.iter_mut().enumerate() {
+    // 1. Required groups and forced actions.
+    for (g, grp) in groups.iter().enumerate() {
         if let Some(why) = &grp.required {
             let note = match &grp.forced {
                 Some((Action::Drop | Action::Summarize, _)) => " (user/rule request to shrink it ignored)",
@@ -366,10 +420,11 @@ pub fn plan(inp: &PolicyInput) -> Plan {
         } else if let Some((a, why)) = &grp.forced {
             match a {
                 Action::Keep => {} // already handled as required
-                Action::Summarize => {
+                Action::Summarize if grp.can_summarize => {
                     decision[g] = Some((Action::Summarize, format!("Summarized: {why}")));
                     used += grp.est as u64;
                 }
+                Action::Summarize => {} // no summary possible: let the budget decide keep vs drop
                 Action::Drop => decision[g] = Some((Action::Drop, format!("Dropped: {why}"))),
             }
         }
@@ -377,16 +432,35 @@ pub fn plan(inp: &PolicyInput) -> Plan {
     let must_tokens = used;
     let over_budget = must_tokens > budget;
 
-    // 2. Hold the unchanged prefix fixed when it still fits (protects prompt caching).
-    let frozen: Vec<usize> =
-        (0..groups.len()).filter(|&g| decision[g].is_none() && groups[g].in_prefix).collect();
-    let frozen_tokens: u64 = frozen.iter().map(|&g| groups[g].tokens as u64).sum();
+    // 2. Repeat last call's decisions for the unchanged prefix when they still fit
+    //    (keeps the provider's prompt cache valid).
+    let group_cost = |grp: &Group, a: Action| -> Option<u64> {
+        Some(match a {
+            Action::Keep => grp.tokens as u64,
+            Action::Drop => 0,
+            Action::Summarize => {
+                // Only repeatable when the real summaries still exist.
+                if !grp.can_summarize || grp.members.iter().any(|&i| nodes[i].kind != NodeKind::ToolCall && nodes[i].summary_tokens.is_none()) {
+                    return None;
+                }
+                grp.est as u64
+            }
+        })
+    };
+    let frozen: Vec<(usize, Action, u64)> = (0..groups.len())
+        .filter(|&g| decision[g].is_none() && groups[g].in_prefix)
+        .filter_map(|g| {
+            let p = groups[g].prev?;
+            Some((g, p, group_cost(&groups[g], p)?))
+        })
+        .collect();
+    let frozen_tokens: u64 = frozen.iter().map(|f| f.2).sum();
     let prefix_frozen = prefix_len > 0 && !over_budget && !frozen.is_empty() && used + frozen_tokens <= budget;
     if prefix_frozen {
-        for &g in &frozen {
-            decision[g] = Some((Action::Keep, "Kept: unchanged prefix (protects prompt cache)".into()));
+        for &(g, a, cost) in &frozen {
+            decision[g] = Some((a, format!("{}: same as last call (protects prompt cache)", verb(a))));
+            used += cost;
         }
-        used += frozen_tokens;
     }
 
     // 3. Greedy knapsack on score density for everything left.
@@ -402,7 +476,7 @@ pub fn plan(inp: &PolicyInput) -> Plan {
         .map(|e| (e.to.as_str(), e.from.as_str()))
         .collect();
     for g in rest {
-        let grp = &groups[g];
+        let grp = &mut groups[g];
         let tokens = grp.tokens as u64;
         let sup = grp
             .members
@@ -415,7 +489,7 @@ pub fn plan(inp: &PolicyInput) -> Plan {
         } else if used + tokens <= budget {
             used += tokens;
             (Action::Keep, format!("Kept: fits budget (score {:.2})", grp.score))
-        } else if used + grp.est as u64 <= budget && grp.score > w.summarize_threshold {
+        } else if grp.can_summarize && used + grp.est as u64 <= budget && grp.score > w.summarize_threshold {
             used += grp.est as u64;
             (Action::Summarize, format!("Summarized: no room in full; score {:.2} above {:.2}", grp.score, w.summarize_threshold))
         } else if grp.score > w.summarize_threshold {
@@ -430,11 +504,6 @@ pub fn plan(inp: &PolicyInput) -> Plan {
         .map(|i| {
             let g = group_of[i];
             let (action, reason) = decision[g].clone().expect("every group decided");
-            let planned = match action {
-                Action::Keep => nodes[i].tokens,
-                Action::Summarize => summary_estimate(nodes[i].tokens),
-                Action::Drop => 0,
-            };
             let reason = if groups[g].members.len() > 1 && !reason.contains("tool pair") {
                 format!("{reason} · tool pair")
             } else {
@@ -446,7 +515,7 @@ pub fn plan(inp: &PolicyInput) -> Plan {
                 reason,
                 score: scores[i],
                 tokens: nodes[i].tokens,
-                planned_tokens: planned,
+                planned_tokens: planned_cost(&nodes[i], action),
                 required: groups[g].required.is_some(),
             }
         })
@@ -488,17 +557,16 @@ pub fn validate_plan(inp: &PolicyInput, plan: &Plan) -> Result<(), String> {
     for (i, (n, item)) in nodes.iter().zip(&plan.items).enumerate() {
         let must = n.kind == NodeKind::System
             || n.pinned
+            || n.locked
             || Some(i) == last_user
             || (inp.provider == Provider::Anthropic && Some(i) == first_user);
         if must && item.decision != Action::Keep {
             return Err(format!("required node {} was {:?}", n.id, item.decision));
         }
-        let expect = match item.decision {
-            Action::Keep => n.tokens,
-            Action::Summarize => summary_estimate(n.tokens),
-            Action::Drop => 0,
-        };
-        if item.planned_tokens != expect {
+        if item.decision == Action::Summarize && n.kind != NodeKind::ToolCall && inp.no_summary.contains(&n.id) {
+            return Err(format!("node {} summarized without an available summary", n.id));
+        }
+        if item.planned_tokens != planned_cost(n, item.decision) {
             return Err(format!("token accounting wrong for {}", n.id));
         }
     }
@@ -521,11 +589,40 @@ mod tests {
     use proptest::prelude::*;
 
     fn node(id: &str, kind: NodeKind, tokens: u32, turn: u32, content: &str) -> PNode {
-        PNode { id: id.into(), kind, content: content.into(), tokens, first_seen_turn: turn, source: None, importance: 0.5, pinned: false, user_action: None }
+        PNode {
+            id: id.into(),
+            kind,
+            content: content.into(),
+            content_hash: [0; 32],
+            tokens,
+            first_seen_turn: turn,
+            source: None,
+            importance: 0.5,
+            pinned: false,
+            locked: false,
+            user_action: None,
+            summary_tokens: None,
+            prev: None,
+        }
     }
 
-    fn input(nodes: Vec<PNode>, edges: Vec<Edge>, budget: u32, latest: u32) -> PolicyInput {
-        PolicyInput { nodes, edges, latest_turn: latest, budget, weights: Weights::default(), rules: vec![], provider: Provider::Anthropic }
+    /// Like the store: nodes that predate the latest turn were sent as-is last call.
+    fn input(mut nodes: Vec<PNode>, edges: Vec<Edge>, budget: u32, latest: u32) -> PolicyInput {
+        for n in nodes.iter_mut() {
+            if n.prev.is_none() && n.first_seen_turn < latest {
+                n.prev = Some(Action::Keep);
+            }
+        }
+        PolicyInput {
+            nodes,
+            edges,
+            latest_turn: latest,
+            budget,
+            weights: Weights::default(),
+            rules: vec![],
+            provider: Provider::Anthropic,
+            no_summary: HashSet::new(),
+        }
     }
 
     fn decisions(p: &Plan) -> Vec<(&str, Action)> {
@@ -535,9 +632,10 @@ mod tests {
     #[test]
     fn everything_is_kept_when_it_fits() {
         let nodes = vec![node("s", NodeKind::System, 10, 0, "sys"), node("u", NodeKind::User, 10, 0, "hi"), node("a", NodeKind::Assistant, 10, 1, "yo")];
-        let p = plan(&input(nodes.clone(), vec![], 1000, 1));
+        let inp = input(nodes, vec![], 1000, 1);
+        let p = plan(&inp);
         assert!(p.items.iter().all(|i| i.decision == Action::Keep));
-        assert!(validate_plan(&input(nodes, vec![], 1000, 1), &p).is_ok());
+        assert!(validate_plan(&inp, &p).is_ok());
     }
 
     #[test]
@@ -566,11 +664,25 @@ mod tests {
         for i in 0..5 {
             nodes.push(node(&format!("x{i}"), NodeKind::Assistant, 50, 9, "filler"));
         }
-        let inp = input(nodes, vec![], 150, 9);
-        let p = plan(&inp);
+        let p = plan(&input(nodes, vec![], 150, 9));
         let item = explain(&p, "p").unwrap();
         assert_eq!(item.decision, Action::Keep);
         assert!(item.reason.contains("pinned") && item.reason.contains("ignored"), "{}", item.reason);
+    }
+
+    #[test]
+    fn locked_blocks_are_never_rewritten() {
+        let mut thinking = node("th", NodeKind::Assistant, 500, 0, "{thinking}");
+        thinking.locked = true;
+        thinking.user_action = Some(Action::Drop);
+        let mut nodes = vec![node("s", NodeKind::System, 10, 0, "s"), node("u", NodeKind::User, 10, 0, "u"), thinking];
+        for i in 0..5 {
+            nodes.push(node(&format!("x{i}"), NodeKind::Assistant, 50, 9, "filler"));
+        }
+        let inp = input(nodes, vec![], 100, 9);
+        let p = plan(&inp);
+        assert_eq!(explain(&p, "th").unwrap().decision, Action::Keep);
+        assert!(validate_plan(&inp, &p).is_ok());
     }
 
     #[test]
@@ -595,6 +707,45 @@ mod tests {
         assert!(d.contains(&("a", Action::Drop)), "user action wins: {d:?}");
         assert!(d.contains(&("b", Action::Summarize)), "rule applies without budget pressure: {d:?}");
         assert!(explain(&p, "b").unwrap().reason.contains("rule"));
+    }
+
+    #[test]
+    fn missing_summary_falls_back_to_keep_when_it_fits_else_drop() {
+        let mut nodes = vec![node("s", NodeKind::System, 5, 0, "s"), node("u", NodeKind::User, 5, 0, "u"), node("big", NodeKind::ToolResult, 400, 0, "x")];
+        for i in 0..4 {
+            nodes.push(node(&format!("t{i}"), NodeKind::Assistant, 5, 10, "t"));
+        }
+        let rule = PolicyRule {
+            id: "r".into(),
+            session_id: None,
+            matcher: Matcher { kind: Some(NodeKind::ToolResult), ..Default::default() },
+            action: Action::Summarize,
+            priority: 1,
+        };
+        let mut inp = input(nodes, vec![], 10_000, 10);
+        inp.rules = vec![rule];
+        assert_eq!(explain(&plan(&inp), "big").unwrap().decision, Action::Summarize);
+
+        inp.no_summary.insert("big".into());
+        let roomy = plan(&inp);
+        assert_eq!(explain(&roomy, "big").unwrap().decision, Action::Keep, "fits, so keep");
+        assert!(validate_plan(&inp, &roomy).is_ok());
+
+        inp.budget = 100;
+        let tight = plan(&inp);
+        assert_eq!(explain(&tight, "big").unwrap().decision, Action::Drop, "no room, so drop");
+        assert!(validate_plan(&inp, &tight).is_ok());
+    }
+
+    #[test]
+    fn real_summary_size_is_used_for_budgeting() {
+        let mut big = node("big", NodeKind::ToolResult, 1000, 0, "x");
+        big.summary_tokens = Some(37);
+        assert_eq!(node_est(&big), 37);
+        big.summary_tokens = Some(5000); // a "summary" larger than the original is useless
+        assert_eq!(node_est(&big), 1000);
+        let call = node("c", NodeKind::ToolCall, 20, 0, "{}");
+        assert_eq!(node_est(&call), 20, "tool calls stay verbatim");
     }
 
     #[test]
@@ -640,18 +791,35 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_prefix_is_frozen_when_it_fits_and_released_when_not() {
+    fn unchanged_prefix_repeats_last_decisions_when_they_fit() {
+        let mut nodes = vec![node("s", NodeKind::System, 10, 0, "s"), node("u", NodeKind::User, 10, 0, "do it")];
+        let mut dropped = node("junk", NodeKind::ToolResult, 100, 1, "zzz");
+        dropped.prev = Some(Action::Drop); // we dropped it last call; it must stay dropped
+        nodes.push(dropped);
+        nodes.push(node("keepme", NodeKind::Assistant, 30, 1, "fine"));
+        for i in 0..4 {
+            nodes.push(node(&format!("t{i}"), NodeKind::Assistant, 10, 5, "t"));
+        }
+        let p = plan(&input(nodes, vec![], 1000, 5));
+        assert!(p.prefix_frozen);
+        let junk = explain(&p, "junk").unwrap();
+        assert_eq!(junk.decision, Action::Drop, "repeating the old decision keeps the cached prefix valid");
+        assert!(junk.reason.contains("same as last call"));
+        assert_eq!(explain(&p, "keepme").unwrap().decision, Action::Keep);
+    }
+
+    #[test]
+    fn prefix_is_released_when_the_budget_forces_edits() {
         let mut nodes = vec![node("s", NodeKind::System, 10, 0, "s"), node("u", NodeKind::User, 10, 0, "do it")];
         nodes.push(node("junk", NodeKind::ToolResult, 100, 1, "zzz"));
         for i in 0..4 {
             nodes.push(node(&format!("t{i}"), NodeKind::Assistant, 10, 5, "t"));
         }
-        let fits = plan(&input(nodes.clone(), vec![], 1000, 5));
-        assert!(fits.prefix_frozen);
-        assert!(fits.cache_prefix_len >= 3);
-
-        let tight = plan(&input(nodes, vec![], 80, 5));
-        assert!(!tight.prefix_frozen || tight.planned_tokens <= 80);
+        let inp = input(nodes, vec![], 80, 5);
+        let tight = plan(&inp);
+        assert!(!tight.prefix_frozen);
+        assert!(tight.planned_tokens <= 80);
+        assert!(validate_plan(&inp, &tight).is_ok());
     }
 
     #[test]
@@ -713,8 +881,11 @@ mod tests {
             })
     }
 
+    /// Per-node random extras: (pin, importance, user action, locked, summary size, previous decision, no_summary).
+    type Flags = (bool, u8, u8, bool, u16, u8, bool);
+
     /// Build a realistic request: system, user, then random steps, with real graph edges.
-    fn build(steps: &[Step], flags: &[(bool, u8, u8)], budget: u32, provider: Provider, rules: Vec<PolicyRule>, tail: usize) -> PolicyInput {
+    fn build(steps: &[Step], flags: &[Flags], budget: u32, provider: Provider, rules: Vec<PolicyRule>, tail: usize) -> PolicyInput {
         let mut nodes = vec![node("n0", NodeKind::System, 40, 0, "system rules"), node("n1", NodeKind::User, 20, 0, "refactor the parser module")];
         let mut meta: Vec<(Option<String>, Option<String>)> = vec![(None, None), (None, None)]; // source, tool_id
         let mut turn = 0u32;
@@ -737,9 +908,11 @@ mod tests {
                 }
             }
         }
+        let mut no_summary = HashSet::new();
         for (i, n) in nodes.iter_mut().enumerate() {
-            let (pin, imp, act) = flags[i % flags.len()];
+            let (pin, imp, act, locked, summ, prev, nosum) = flags[i % flags.len()];
             n.pinned = pin && i % 7 == 0;
+            n.locked = locked && i % 11 == 3;
             n.importance = imp as f32 / 255.0;
             n.user_action = match act % 8 {
                 1 => Some(Action::Keep),
@@ -747,6 +920,20 @@ mod tests {
                 3 => Some(Action::Drop),
                 _ => None,
             };
+            if summ % 3 == 0 {
+                n.summary_tokens = Some(summ as u32 % 700);
+            }
+            if n.first_seen_turn < turn {
+                n.prev = match prev % 4 {
+                    0 => Some(Action::Drop),
+                    1 => Some(Action::Summarize),
+                    2 => None,
+                    _ => Some(Action::Keep),
+                };
+            }
+            if nosum && i % 5 == 0 {
+                no_summary.insert(n.id.clone());
+            }
         }
         let g: Vec<GNode> = nodes
             .iter()
@@ -755,7 +942,11 @@ mod tests {
             .collect();
         let all: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
         let edges = build_edges(&g, &all);
-        PolicyInput { nodes, edges, latest_turn: turn, budget, weights: Weights { protect_tail: tail, ..Weights::default() }, rules, provider }
+        PolicyInput { nodes, edges, latest_turn: turn, budget, weights: Weights { protect_tail: tail, ..Weights::default() }, rules, provider, no_summary }
+    }
+
+    fn flags() -> impl Strategy<Value = Flags> {
+        (any::<bool>(), any::<u8>(), any::<u8>(), any::<bool>(), any::<u16>(), any::<u8>(), any::<bool>())
     }
 
     proptest! {
@@ -764,7 +955,7 @@ mod tests {
         #[test]
         fn every_plan_is_valid(
             steps in prop::collection::vec(step(), 0..40),
-            flags in prop::collection::vec((any::<bool>(), any::<u8>(), any::<u8>()), 1..12),
+            flags in prop::collection::vec(flags(), 1..12),
             budget in 0u32..20_000,
             openai in any::<bool>(),
             rules in prop::collection::vec(rule(), 0..3),
@@ -782,8 +973,11 @@ mod tests {
         fn generous_budget_without_rules_or_overrides_keeps_everything(
             steps in prop::collection::vec(step(), 0..30),
         ) {
-            let mut inp = build(&steps, &[(false, 128, 0)], u32::MAX / 2, Provider::Anthropic, vec![], 4);
-            inp.nodes.iter_mut().for_each(|n| n.user_action = None);
+            let mut inp = build(&steps, &[(false, 128, 0, false, 1, 3, false)], u32::MAX / 2, Provider::Anthropic, vec![], 4);
+            inp.nodes.iter_mut().for_each(|n| {
+                n.user_action = None;
+                n.prev = n.prev.map(|_| Action::Keep);
+            });
             let p = plan(&inp);
             prop_assert!(p.items.iter().all(|i| i.decision == Action::Keep));
             prop_assert_eq!(p.planned_tokens, p.original_tokens);

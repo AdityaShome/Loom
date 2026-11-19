@@ -1,6 +1,6 @@
 import { api } from "./api";
 import { useInterval, useLoad } from "./hooks";
-import { fmtTime } from "./format";
+import { fmtTime, fmtTokens } from "./format";
 
 export default function Sessions() {
   const { data, error, reload } = useLoad(api.sessions, []);
@@ -27,6 +27,7 @@ export default function Sessions() {
           <th>Provider</th>
           <th className="num">Turns</th>
           <th className="num">Nodes</th>
+          <th className="num">Saved</th>
           <th>Mode</th>
           <th>Started</th>
         </tr>
@@ -41,6 +42,7 @@ export default function Sessions() {
             <td>{s.provider ?? "—"}</td>
             <td className="num">{s.turns}</td>
             <td className="num">{s.nodes}</td>
+            <td className="num">{s.saved_tokens > 0 ? fmtTokens(s.saved_tokens) : <span className="muted">—</span>}</td>
             <td>{s.mode}</td>
             <td className="muted">{fmtTime(s.created_at)}</td>
           </tr>

@@ -1,6 +1,8 @@
-//! Phase 1 gateway: transparent streaming passthrough to the upstream API.
-//! Bytes are forwarded unchanged in both directions; only hop-by-hop headers
-//! and Loom's own session header are removed.
+//! Gateway: streaming passthrough to the upstream API.
+//! Bytes are forwarded unchanged in both directions (only hop-by-hop headers and
+//! Loom's own session header are removed), except for sessions in Enforce mode,
+//! whose requests are rewritten first. Any failure in Loom falls back to the
+//! original request.
 
 use std::{sync::Arc, time::Instant};
 
@@ -19,6 +21,8 @@ use loom_core::{
 };
 use loom_store::Store;
 
+use crate::summarizer::{Creds, Summarizer, SummarizerConfig};
+
 const MAX_BODY: usize = 256 * 1024 * 1024;
 
 pub struct State {
@@ -26,6 +30,7 @@ pub struct State {
     anthropic: String,
     openai: String,
     pub store: Option<Arc<Store>>,
+    pub summarizer: Option<Arc<Summarizer>>,
     /// Live events for WebSocket subscribers.
     pub events: tokio::sync::broadcast::Sender<Event>,
 }
@@ -54,6 +59,7 @@ impl State {
             anthropic: anthropic.trim_end_matches('/').to_string(),
             openai: openai.trim_end_matches('/').to_string(),
             store: None,
+            summarizer: None,
             events: tokio::sync::broadcast::channel(256).0,
         }
     }
@@ -61,6 +67,17 @@ impl State {
     pub fn with_store(mut self, store: Arc<Store>) -> Self {
         self.store = Some(store);
         self
+    }
+
+    /// Enable summarizing (needs a store for the summary cache).
+    pub fn with_summarizer(mut self, cfg: SummarizerConfig) -> Self {
+        let store = self.store.clone().expect("with_store must be called before with_summarizer");
+        self.summarizer = Some(Arc::new(Summarizer::new(cfg, store)));
+        self
+    }
+
+    pub fn upstreams(&self) -> (&str, &str) {
+        (&self.anthropic, &self.openai)
     }
 }
 
@@ -109,13 +126,36 @@ async fn proxy(AxState(st): AxState<Arc<State>>, req: Request) -> Response {
     let hdr = parts.headers.get(SESSION_HEADER).and_then(|v| v.to_str().ok());
     let session = resolve_session(hdr, &body);
 
-    // Record the conversation off the request path. Errors never reach the agent.
+    // Conversations are recorded for every chat request. Sessions in Enforce mode are
+    // also rewritten before forwarding; every error path forwards the original body.
+    let mut body = body;
     if let (Some(store), Some(sid), Some(provider)) =
         (st.store.clone(), session.clone(), ingest_provider(&parts.method, parts.uri.path()))
     {
-        let body = body.clone();
-        let events = st.events.clone();
-        tokio::spawn(async move { record(store, events, provider, sid, body).await });
+        let creds = Creds::from_headers(provider, &parts.headers);
+        let enforcing = matches!(store.session_mode(&sid).await, Ok(Some(m)) if m == "Enforce");
+        if enforcing {
+            match crate::enforce::enforce(&store, st.summarizer.as_ref(), &st.events, provider, &sid, &body, &creds).await {
+                Ok(done) => {
+                    tracing::info!(
+                        session = %sid,
+                        original_tokens = done.original_tokens,
+                        sent_tokens = done.sent_tokens,
+                        summarized = done.summarized,
+                        dropped = done.dropped,
+                        rewritten = done.body.is_some(),
+                        "enforced"
+                    );
+                    if let Some(b) = done.body {
+                        body = b;
+                    }
+                }
+                Err(e) => tracing::warn!(session = %sid, error = %e, "enforce failed; forwarding the original request"),
+            }
+        } else {
+            let (body, events, summarizer) = (body.clone(), st.events.clone(), st.summarizer.clone());
+            tokio::spawn(async move { record(store, summarizer, events, provider, sid, body, creds).await });
+        }
     }
 
     let path = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
@@ -181,10 +221,12 @@ fn ingest_provider(method: &axum::http::Method, path: &str) -> Option<Provider> 
 
 async fn record(
     store: Arc<Store>,
+    summarizer: Option<Arc<Summarizer>>,
     events: tokio::sync::broadcast::Sender<Event>,
     provider: Provider,
     session: String,
     body: bytes::Bytes,
+    creds: Creds,
 ) {
     let n = match normalize(provider, &body) {
         Ok(n) => n,
@@ -196,6 +238,12 @@ async fn record(
                 %session, turn = r.turn, messages = r.total, new = r.new, missing = r.missing, tokens = r.tokens,
                 "ingested"
             );
+            // In Suggest mode, get summaries ready before they are needed.
+            if let Some(sum) = summarizer {
+                if matches!(store.session_mode(&session).await, Ok(Some(m)) if m == "Suggest") {
+                    tokio::spawn(crate::enforce::prefetch(store.clone(), sum, session.clone(), creds));
+                }
+            }
             // Err just means nobody is listening.
             let _ = events.send(Event {
                 session,
