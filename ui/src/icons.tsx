@@ -22,7 +22,7 @@ function svg(children: ReactNode, { size = 20, color = "currentColor", className
   );
 }
 
-export function Icon({ name, ...p }: Props & { name: IconName | "check" | "search" | "filter" | "fit" | "expand" | "bulb" | "link" | "arrow" | "layers" | "clock" | "graph" }) {
+export function Icon({ name, ...p }: Props & { name: IconName | "check" | "alert" | "search" | "filter" | "fit" | "expand" | "bulb" | "link" | "arrow" | "layers" | "clock" | "graph" }) {
   switch (name) {
     case "shield":
       return svg(<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z" />, p);
@@ -54,6 +54,42 @@ export function Icon({ name, ...p }: Props & { name: IconName | "check" | "searc
           <rect x="6" y="6" width="12" height="12" rx="2.5" />
           <rect x="9.5" y="9.5" width="5" height="5" rx="1" />
           <path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3" />
+        </>,
+        p,
+      );
+    case "sliders":
+      return svg(
+        <>
+          <path d="M4 7h9M17 7h3M4 17h3M11 17h9" />
+          <circle cx="15" cy="7" r="2" />
+          <circle cx="9" cy="17" r="2" />
+        </>,
+        p,
+      );
+    case "gauge":
+      return svg(
+        <>
+          <path d="M4.5 17a8 8 0 1 1 15 0" />
+          <path d="M12 16l3.5-5" />
+          <circle cx="12" cy="16" r="1.3" />
+        </>,
+        p,
+      );
+    case "bolt":
+      return svg(<path d="M13 3L5 14h6l-1 7 8-11h-6z" />, p);
+    case "copy":
+      return svg(
+        <>
+          <rect x="8" y="8" width="12" height="12" rx="2" />
+          <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" />
+        </>,
+        p,
+      );
+    case "alert":
+      return svg(
+        <>
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 7.5v5M12 16h.01" />
         </>,
         p,
       );

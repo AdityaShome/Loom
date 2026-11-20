@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { Edge, NodeRow, Plan } from "./api";
+import type { Edge, NodeRow, Plan, Rule } from "./api";
+import { layoutHubs } from "./MindMap";
 import {
   buildModel,
   capLeaves,
@@ -10,6 +11,7 @@ import {
   historyOf,
   hubInsights,
   hubOf,
+  HUB_META,
   inContext,
   nodesOf,
   related,
@@ -108,7 +110,7 @@ describe("model", () => {
   it("builds the hubs that have content and totals tokens", () => {
     const { nodes, edges } = session();
     const m = buildModel({ nodes, edges, plan: plan(), mode: "Suggest", latest: 2 });
-    expect(m.hubs.map((h) => h.id).sort()).toEqual(["assistant", "knowledge", "plan", "system", "tools", "user"]);
+    expect(m.hubs.map((h) => h.id).sort()).toEqual(["assistant", "budget", "cache", "knowledge", "plan", "system", "tools", "user", "waste"]);
     expect(m.total).toBe(20 + 15 + 9 + 1400 + 9 + 700 + 6 + 30 + 40 + 12);
     expect(m.edges.every((e) => m.byId.has(e.from) && m.byId.has(e.to))).toBe(true);
   });
@@ -117,7 +119,7 @@ describe("model", () => {
     const { nodes, edges } = session();
     const onlyUser = nodes.filter((n) => n.kind === "User");
     const m = buildModel({ nodes: onlyUser, edges, plan: null, mode: "Observe", latest: 2 });
-    expect(m.hubs.map((h) => h.id).sort()).toEqual(["plan", "user"]);
+    expect(m.hubs.map((h) => h.id).sort()).toEqual(["plan", "user"]); // no plan: no budget, cache or reclaimable blocks
     expect(buildModel({ nodes: [], edges: [], plan: null, mode: "Observe", latest: 0 }).hubs).toEqual([]);
   });
 
@@ -157,7 +159,8 @@ describe("model", () => {
     const summarized = p.leaves.find((l) => l.label === "Summarized")!;
     expect(summarized.nodeIds).toEqual(["r1"]);
     expect(p.leaves.map((l) => l.label)).toEqual(["Kept", "Summarized"]);
-    expect(p.subtitle).toBe("1.1k / 1.0k tok");
+    expect(p.subtitle).toBe("9 keep · 1 sum · 0 drop");
+    expect(summarized.sub).toBe("1 node · 1.4k→280");
   });
 });
 
@@ -268,5 +271,129 @@ describe("history and flow", () => {
   it("shorten collapses whitespace and truncates", () => {
     expect(shorten("  a   b\n c ", 20)).toBe("a b c");
     expect(shorten("abcdefghij", 5)).toBe("abcd…");
+  });
+});
+
+describe("status blocks", () => {
+  const build = (over: Partial<Plan> = {}, extra: Partial<Parameters<typeof buildModel>[0]> = {}) => {
+    const { nodes, edges } = session();
+    return { nodes, m: buildModel({ nodes, edges, plan: plan(over), mode: "Enforce", latest: 2, ...extra }) };
+  };
+  const hub = (m: ReturnType<typeof buildModel>, id: string) => m.hubs.find((h) => h.id === id);
+
+  it("budget block shows floor, planned and saved, and turns red when over budget", () => {
+    const { m } = build();
+    const b = hub(m, "budget")!;
+    expect(b.subtitle).toBe("1.1k / 1.0k tok");
+    expect(b.leaves.map((l) => l.label)).toEqual(["Required floor", "Planned", "Saved"]);
+    expect(b.leaves[2].sub).toBe("1,120 · 50%");
+    expect(b.leaves[1].color).toBe("#34d399");
+
+    const over = hub(build({ over_budget: true, must_tokens: 1500 }).m, "budget")!;
+    expect(over.leaves[1].label).toBe("Over budget");
+    expect(over.leaves[0].color).toBe("#f87171");
+  });
+
+  it("gauge reports how full the context is", () => {
+    const { m } = build();
+    expect(m.gauge.used).toBe(2241);
+    expect(m.gauge.budget).toBe(1000);
+    expect(m.gauge.tone).toBe("bad");
+    const { nodes, edges } = session();
+    const roomy = buildModel({ nodes, edges, plan: plan({ budget: 100_000 }), mode: "Observe", latest: 2 });
+    expect(roomy.gauge.tone).toBe("good");
+  });
+
+  it("reclaimable block lists older reads that a newer read replaced", () => {
+    const { m } = build();
+    const w = hub(m, "waste")!;
+    expect(w.leaves).toHaveLength(1);
+    expect(w.leaves[0].label).toBe("README.md");
+    expect(w.leaves[0].sub).toBe("replaced by turn 1 · 1,400");
+    expect(w.subtitle).toBe("1 older read · 1.4k tok");
+    expect(w.nodeIds).toEqual(["r1"]);
+  });
+
+  it("no reclaimable block when nothing was superseded", () => {
+    const { nodes } = session();
+    const m = buildModel({ nodes, edges: [], plan: plan(), mode: "Enforce", latest: 2 });
+    expect(hub(m, "waste")).toBeUndefined();
+  });
+
+  it("cache block splits the unchanged start from what is new, and explains the freeze", () => {
+    const { m } = build({ cache_prefix_len: 8, prefix_frozen: true });
+    const c = hub(m, "cache")!;
+    expect(c.subtitle).toBe("8 unchanged · 1 new");
+    const [prefix, fresh, frozen] = c.leaves;
+    expect(prefix.nodeIds).toHaveLength(8);
+    expect(fresh.nodeIds).toEqual(["u2"]);
+    expect(frozen.label).toBe("Decisions repeated");
+    expect(frozen.notes?.[0]).toContain("prompt cache keeps working");
+
+    const released = hub(build({ cache_prefix_len: 8, prefix_frozen: false }).m, "cache")!;
+    expect(released.leaves[2].label).toBe("Not held fixed");
+    expect(released.leaves[2].notes?.[0]).toContain("restarts");
+    const first = hub(build({ cache_prefix_len: 0, prefix_frozen: false }).m, "cache")!;
+    expect(first.leaves.map((l) => l.id)).toEqual(["fresh", "frozen"]);
+    expect(first.leaves[1].notes?.[0]).toContain("first request");
+  });
+
+  it("controls block appears for pins, forced actions and rules, and not otherwise", () => {
+    expect(hub(build().m, "controls")).toBeUndefined();
+
+    const { nodes, edges } = session();
+    nodes.find((n) => n.id === "sys")!.pinned = true;
+    nodes.find((n) => n.id === "r1")!.user_action = "Drop";
+    const rule: Rule = { id: "r", session_id: null, matcher: { kind: "File", min_tokens: 1000 }, action: "Summarize", priority: 2 };
+    const m = buildModel({ nodes, edges, plan: plan(), mode: "Suggest", latest: 2, rules: [rule] });
+    const c = hub(m, "controls")!;
+    expect(c.subtitle).toBe("1 pinned · 1 rule");
+    expect(c.leaves.map((l) => l.label)).toEqual(["Pinned", "Forced Drop", "1 rule"]);
+    const rules = c.leaves[2];
+    expect(rules.nodeIds).toEqual([]);
+    expect(rules.notes).toEqual(["kind is File and over 1000 tokens → Summarize (priority 2, all sessions)"]);
+    expect(c.nodeIds.sort()).toEqual(["r1", "sys"]);
+  });
+
+  it("hub insights explain each status block", () => {
+    const { nodes, edges } = session();
+    nodes.find((n) => n.id === "sys")!.pinned = true;
+    const p = plan({ cache_prefix_len: 5, prefix_frozen: true });
+    const m = buildModel({ nodes, edges, plan: p, mode: "Enforce", latest: 2 });
+    const ctx = { budget: 1000, plan: p, mode: "Enforce", latest: 2 };
+    const text = (id: string) => hubInsights(m.hubs.find((h) => h.id === id)!, m, ctx).map((i) => i.text).join(" | ");
+    expect(text("budget")).toContain("Budget 1,000 tokens");
+    expect(text("budget")).toContain("1,120 tokens saved");
+    expect(text("cache")).toContain("5 nodes at the start");
+    expect(text("cache")).toContain("stays valid");
+    expect(text("waste")).toContain("1,400 tokens sit in 1 older read");
+    expect(text("controls")).toContain("1 node pinned");
+  });
+});
+
+describe("layout", () => {
+  const hubsFor = (ids: string[]) =>
+    ids.map((id) => {
+      const meta = HUB_META[id as keyof typeof HUB_META];
+      return { id, title: meta.title, subtitle: "", color: meta.color, icon: meta.icon, side: meta.side, order: meta.order, nodeIds: [], tokens: 0, leaves: [], notes: [] };
+    }) as Parameters<typeof layoutHubs>[0];
+
+  it("grows taller with more blocks and never overlaps them", () => {
+    const small = layoutHubs(hubsFor(["system", "user", "assistant"]));
+    const big = layoutHubs(hubsFor(Object.keys(HUB_META)));
+    expect(big.H).toBeGreaterThan(small.H);
+    for (const left of [true, false]) {
+      const ys = big.placed.filter((p) => p.left === left).sort((a, b) => a.y - b.y).map((p) => p.y);
+      expect(ys.length).toBe(5);
+      for (let i = 1; i < ys.length; i++) expect(ys[i] - ys[i - 1]).toBeGreaterThanOrEqual(140);
+    }
+  });
+
+  it("keeps blocks in their declared order and side", () => {
+    const { placed } = layoutHubs(hubsFor(["waste", "plan", "knowledge", "controls", "system"]));
+    const right = placed.filter((p) => !p.left).sort((a, b) => a.y - b.y).map((p) => p.hub.id);
+    const left = placed.filter((p) => p.left).sort((a, b) => a.y - b.y).map((p) => p.hub.id);
+    expect(right).toEqual(["knowledge", "plan", "waste"]);
+    expect(left).toEqual(["system", "controls"]);
   });
 });

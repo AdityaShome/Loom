@@ -62,10 +62,12 @@ function insightsFor(sel: Selection, m: Model, c: Ctx): Insight[] {
       return centerInsights(m, c);
     case "hub": {
       const h = m.hubs.find((x) => x.id === sel.id);
-      return h ? hubInsights(h, m) : [];
+      return h ? hubInsights(h, m, c) : [];
     }
     case "leaf": {
       const ns = nodesOf(sel, m);
+      const notes = m.hubs.find((h) => h.id === sel.hub)?.leaves.find((l) => l.id === sel.leaf)?.notes ?? [];
+      if (notes.length) return notes.map((text) => ({ text }));
       return [
         { text: `${ns.length} node${ns.length === 1 ? "" : "s"}, ${fmtTokens(ns.reduce((s, n) => s + n.tokens, 0))} tokens` },
         ...ns.slice(0, 1).flatMap((n) => nodeInsights(n, m).slice(1, 3)),
@@ -131,7 +133,7 @@ export default function GraphPanel({
           <ul className="cg-insights">
             {insights.map((i, k) => (
               <li key={k} className={i.tone}>
-                <Icon name="check" size={15} />
+                <Icon name={i.tone === "warn" || i.tone === "bad" ? "alert" : "check"} size={15} />
                 <span>{i.text}</span>
               </li>
             ))}

@@ -2,19 +2,32 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Icon } from "./icons";
 import type { Hub, HubId, Leaf, Model, Selection } from "./graphModel";
 
-// Design coordinates; the stage is scaled to fit the available space.
+// Design coordinates; the stage is scaled to fit the available space. The height grows with
+// the number of blocks on a side, so any number of status blocks fit without overlapping.
 export const W = 1100;
-export const H = 620;
 const CX = W / 2;
-const CY = H / 2;
-const CENTER = { w: 214, h: 78 };
+const CENTER = { w: 214, h: 84 };
 const HUB = { w: 212, h: 66 };
 const LEAF = { w: 140, h: 30 };
 const HUB_X = { left: 285, right: 815 };
 const LEAF_X = { left: 76, right: 1024 };
-const SLOT_Y = [106, CY, H - 106];
+const ROW = 150;
 
 type Pt = [number, number];
+
+type Placed = { hub: Hub; x: number; y: number; left: boolean };
+
+/** Place the visible hubs: evenly down each side, in order. */
+export function layoutHubs(hubs: Hub[]): { placed: Placed[]; H: number; CY: number } {
+  const side = (s: "left" | "right") => hubs.filter((h) => h.side === s).sort((a, b) => a.order - b.order);
+  const left = side("left");
+  const right = side("right");
+  const rows = Math.max(left.length, right.length, 3);
+  const H = Math.max(620, rows * ROW + 36);
+  const place = (list: Hub[], isLeft: boolean): Placed[] =>
+    list.map((hub, i) => ({ hub, left: isLeft, x: isLeft ? HUB_X.left : HUB_X.right, y: (H / list.length) * (i + 0.5) }));
+  return { placed: [...place(left, true), ...place(right, false)], H, CY: H / 2 };
+}
 
 /** Horizontal S-curve between two points. */
 const curve = ([x1, y1]: Pt, [x2, y2]: Pt) => {
@@ -22,22 +35,27 @@ const curve = ([x1, y1]: Pt, [x2, y2]: Pt) => {
   return `M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`;
 };
 
-/** From the centre card: leave vertically for the top and bottom hubs, horizontally for the middle one. */
-function centerCurve(h: Hub): { d: string; from: Pt; to: Pt } {
-  const left = h.side === "left";
-  const hy = SLOT_Y[h.slot];
-  const to: Pt = [left ? HUB_X.left + HUB.w / 2 : HUB_X.right - HUB.w / 2, hy];
-  if (h.slot === 1) {
-    const from: Pt = [left ? CX - CENTER.w / 2 : CX + CENTER.w / 2, CY];
+/**
+ * From the centre card to a hub. Hubs level with the centre leave from its side; the others leave from its
+ * top or bottom edge. The farthest hub leaves nearest the axis so curves on one side never cross.
+ */
+function centerCurve(p: Placed, all: Placed[], CY: number): { d: string; from: Pt; to: Pt } {
+  const to: Pt = [p.left ? p.x + HUB.w / 2 : p.x - HUB.w / 2, p.y];
+  const dy = p.y - CY;
+  if (Math.abs(dy) < 24) {
+    const from: Pt = [p.left ? CX - CENTER.w / 2 : CX + CENTER.w / 2, CY];
     return { d: curve(from, to), from, to };
   }
-  const from: Pt = [CX + (left ? -52 : 52), h.slot === 0 ? CY - CENTER.h / 2 : CY + CENTER.h / 2];
-  return { d: `M${from[0]},${from[1]} C${from[0]},${to[1]} ${from[0] + (to[0] - from[0]) * 0.55},${to[1]} ${to[0]},${to[1]}`, from, to };
+  const sameHalf = all.filter((o) => o.left === p.left && Math.sign(o.y - CY) === Math.sign(dy) && Math.abs(o.y - CY) >= 24);
+  const farther = sameHalf.filter((o) => Math.abs(o.y - CY) > Math.abs(dy)).length; // 0 = the farthest
+  const offset = 26 + 24 * farther;
+  const from: Pt = [CX + (p.left ? -offset : offset), dy < 0 ? CY - CENTER.h / 2 : CY + CENTER.h / 2];
+  const d = `M${from[0]},${from[1]} C${from[0]},${to[1]} ${from[0] + (to[0] - from[0]) * 0.55},${to[1]} ${to[0]},${to[1]}`;
+  return { d, from, to };
 }
 
-function leafY(i: number, n: number, slot: number): number {
-  const gap = 46;
-  return SLOT_Y[slot] + (i - (n - 1) / 2) * gap;
+function leafY(i: number, n: number, hubY: number): number {
+  return hubY + (i - (n - 1) / 2) * 46;
 }
 
 type Props = {
@@ -56,6 +74,9 @@ export default function MindMap({ model, hidden, selection, onSelect, title, sub
   const touched = useRef(false);
   const [view, setView] = useState({ k: 1, x: 0, y: 0 });
 
+  const hubs = useMemo(() => model.hubs.filter((h) => !hidden.has(h.id)), [model.hubs, hidden]);
+  const { placed, H, CY } = useMemo(() => layoutHubs(hubs), [hubs]);
+
   const fit = useCallback(() => {
     const el = vp.current;
     if (!el) return;
@@ -63,9 +84,9 @@ export default function MindMap({ model, hidden, selection, onSelect, title, sub
     if (!width || !height) return;
     const k = Math.min(width / W, height / H, 1.2) * 0.98;
     setView({ k, x: (width - W * k) / 2, y: (height - H * k) / 2 });
-  }, []);
+  }, [H]);
 
-  // Refit on request and while the user has not moved the view themselves.
+  // Refit on request, when the number of blocks changes the height, and while the user has not moved the view.
   useEffect(() => {
     touched.current = false;
     fit();
@@ -89,7 +110,7 @@ export default function MindMap({ model, hidden, selection, onSelect, title, sub
       const px = e.clientX - r.left;
       const py = e.clientY - r.top;
       setView((p) => {
-        const k = Math.min(2.5, Math.max(0.35, p.k * Math.exp(-e.deltaY * 0.0015)));
+        const k = Math.min(2.5, Math.max(0.3, p.k * Math.exp(-e.deltaY * 0.0015)));
         const ratio = k / p.k;
         return { k, x: px - (px - p.x) * ratio, y: py - (py - p.y) * ratio };
       });
@@ -105,7 +126,7 @@ export default function MindMap({ model, hidden, selection, onSelect, title, sub
     if (!el) return;
     const { width, height } = el.getBoundingClientRect();
     setView((p) => {
-      const k = Math.min(2.5, Math.max(0.35, p.k * f));
+      const k = Math.min(2.5, Math.max(0.3, p.k * f));
       const ratio = k / p.k;
       return { k, x: width / 2 - (width / 2 - p.x) * ratio, y: height / 2 - (height / 2 - p.y) * ratio };
     });
@@ -115,25 +136,20 @@ export default function MindMap({ model, hidden, selection, onSelect, title, sub
   const matching = useMemo(() => {
     if (!q) return null;
     return new Set(
-      model.nodes
-        .filter((n) => `${n.kind} ${n.source ?? ""} ${n.preview}`.toLowerCase().includes(q))
-        .map((n) => n.id),
+      model.nodes.filter((n) => `${n.kind} ${n.source ?? ""} ${n.preview}`.toLowerCase().includes(q)).map((n) => n.id),
     );
   }, [model.nodes, q]);
   const dim = (ids: string[]) => (matching ? !ids.some((id) => matching.has(id)) : false);
 
-  const hubs = model.hubs.filter((h) => !hidden.has(h.id));
   const isSel = (s: Selection) => JSON.stringify(s) === JSON.stringify(selection);
-  const hubActive = (h: Hub) => selection.kind === "hub" && selection.id === h.id || selection.kind === "leaf" && selection.hub === h.id;
+  const hubActive = (h: Hub) => (selection.kind === "hub" && selection.id === h.id) || (selection.kind === "leaf" && selection.hub === h.id);
 
   const links: { key: string; d: string; color: string; from: Pt; to: Pt; on: boolean; dim: boolean }[] = [];
   const cards: React.ReactNode[] = [];
 
-  for (const h of hubs) {
-    const left = h.side === "left";
-    const hy = SLOT_Y[h.slot];
-    const hx = left ? HUB_X.left : HUB_X.right;
-    const c = centerCurve(h);
+  for (const p of placed) {
+    const { hub: h, left } = p;
+    const c = centerCurve(p, placed, CY);
     const hubDim = dim(h.nodeIds);
     links.push({ key: `c-${h.id}`, ...c, color: h.color, on: hubActive(h) || selection.kind === "center", dim: hubDim });
 
@@ -141,7 +157,7 @@ export default function MindMap({ model, hidden, selection, onSelect, title, sub
       <button
         key={`hub-${h.id}`}
         className={`cg-card cg-hub ${isSel({ kind: "hub", id: h.id }) ? "sel" : ""} ${hubDim ? "dim" : ""}`}
-        style={{ left: hx - HUB.w / 2, top: hy - HUB.h / 2, width: HUB.w, height: HUB.h, ["--c" as string]: h.color }}
+        style={{ left: p.x - HUB.w / 2, top: p.y - HUB.h / 2, width: HUB.w, height: HUB.h, ["--c" as string]: h.color }}
         onClick={() => onSelect({ kind: "hub", id: h.id })}
         aria-label={`${h.title}: ${h.subtitle}`}
       >
@@ -157,12 +173,12 @@ export default function MindMap({ model, hidden, selection, onSelect, title, sub
 
     const n = h.leaves.length;
     h.leaves.forEach((l: Leaf, i) => {
-      const ly = leafY(i, n, h.slot);
+      const ly = leafY(i, n, p.y);
       const lx = left ? LEAF_X.left : LEAF_X.right;
-      const from: Pt = [left ? hx - HUB.w / 2 : hx + HUB.w / 2, hy];
+      const from: Pt = [left ? p.x - HUB.w / 2 : p.x + HUB.w / 2, p.y];
       const to: Pt = [left ? lx + LEAF.w / 2 : lx - LEAF.w / 2, ly];
       const sel: Selection = l.more ? { kind: "hub", id: h.id } : { kind: "leaf", hub: h.id, leaf: l.id };
-      const leafDim = dim(l.nodeIds);
+      const leafDim = l.nodeIds.length ? dim(l.nodeIds) : matching != null;
       links.push({
         key: `l-${h.id}-${l.id}`,
         d: curve(from, to),
@@ -187,6 +203,9 @@ export default function MindMap({ model, hidden, selection, onSelect, title, sub
       );
     });
   }
+
+  const g = model.gauge;
+  const gaugeColor = g.tone === "bad" ? "#f87171" : g.tone === "warn" ? "#fbbf24" : "#34d399";
 
   return (
     <div
@@ -236,6 +255,16 @@ export default function MindMap({ model, hidden, selection, onSelect, title, sub
               <b>{title}</b>
               <small>{subtitle}</small>
             </span>
+            {g.budget > 0 && (
+              <span
+                className="cg-gauge"
+                role="img"
+                aria-label={`${Math.round(g.ratio * 100)}% of the token budget`}
+                title={`${g.used.toLocaleString()} of ${g.budget.toLocaleString()} tokens`}
+              >
+                <i style={{ width: `${Math.min(100, g.ratio * 100)}%`, background: gaugeColor, boxShadow: `0 0 8px ${gaugeColor}` }} />
+              </span>
+            )}
           </button>
         )}
         {cards}

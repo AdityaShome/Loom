@@ -1,22 +1,49 @@
 // Turns the nodes of one session into the hub-and-spoke picture: a central session node,
 // category hubs around it, and leaf pills under each hub. Pure functions, no React.
+//
+// Hubs come in two kinds. Content hubs group what is *in* the context (System, User, Tools,
+// Assistant, Knowledge). Status hubs describe what Loom is doing with it (Plan, Budget, Cache,
+// Controls, Waste) and only appear when there is something to say.
 
-import type { Action, Edge, NodeRow, Plan, PlanItem, Turn } from "./api";
+import type { Action, Edge, NodeRow, Plan, PlanItem, Rule, Turn } from "./api";
 import { fmtTokens } from "./format";
 
-export type HubId = "system" | "user" | "tools" | "assistant" | "knowledge" | "plan";
-export type IconName = "shield" | "user" | "wrench" | "chat" | "book" | "pulse" | "cpu";
+export type HubId =
+  | "system"
+  | "user"
+  | "tools"
+  | "assistant"
+  | "knowledge"
+  | "controls"
+  | "cache"
+  | "plan"
+  | "budget"
+  | "waste";
+export type IconName = "shield" | "user" | "wrench" | "chat" | "book" | "pulse" | "cpu" | "sliders" | "gauge" | "bolt" | "copy";
 
-export const HUB_META: Record<
-  HubId,
-  { title: string; color: string; icon: IconName; side: "left" | "right"; slot: 0 | 1 | 2; blurb: string }
-> = {
-  system: { title: "System", color: "#60a5fa", icon: "shield", side: "left", slot: 0, blurb: "Instructions the agent was started with. Always kept." },
-  user: { title: "User", color: "#2dd4bf", icon: "user", side: "left", slot: 1, blurb: "What you asked the agent to do." },
-  tools: { title: "Tools & Actions", color: "#f472b6", icon: "wrench", side: "left", slot: 2, blurb: "Tool calls and what they returned. A call and its result always move together." },
-  assistant: { title: "Assistant", color: "#a78bfa", icon: "chat", side: "right", slot: 0, blurb: "The model's own replies in this conversation." },
-  knowledge: { title: "Knowledge", color: "#34d399", icon: "book", side: "right", slot: 1, blurb: "Files and memory entries the agent pulled into context." },
-  plan: { title: "Context Plan", color: "#fb923c", icon: "pulse", side: "right", slot: 2, blurb: "What Loom keeps, summarizes or drops to stay within the budget." },
+export type HubMeta = {
+  title: string;
+  color: string;
+  icon: IconName;
+  side: "left" | "right";
+  /** Position among the hubs on its side, top to bottom. */
+  order: number;
+  /** Content hubs hold nodes of one kind of thing; status hubs describe the plan. */
+  content: boolean;
+  blurb: string;
+};
+
+export const HUB_META: Record<HubId, HubMeta> = {
+  system: { title: "System", color: "#60a5fa", icon: "shield", side: "left", order: 0, content: true, blurb: "Instructions the agent was started with. Always kept." },
+  user: { title: "User", color: "#2dd4bf", icon: "user", side: "left", order: 1, content: true, blurb: "What you asked the agent to do." },
+  tools: { title: "Tools & Actions", color: "#f472b6", icon: "wrench", side: "left", order: 2, content: true, blurb: "Tool calls and what they returned. A call and its result always move together." },
+  controls: { title: "Your Controls", color: "#facc15", icon: "sliders", side: "left", order: 3, content: false, blurb: "Nodes you pinned or forced, and the rules that apply to this session. These override the scoring." },
+  cache: { title: "Prompt Cache", color: "#22d3ee", icon: "bolt", side: "left", order: 4, content: false, blurb: "Providers cache the unchanged start of a request. Loom repeats its earlier decisions there so that cache stays valid." },
+  assistant: { title: "Assistant", color: "#a78bfa", icon: "chat", side: "right", order: 0, content: true, blurb: "The model's own replies in this conversation." },
+  knowledge: { title: "Knowledge", color: "#34d399", icon: "book", side: "right", order: 1, content: true, blurb: "Files and memory entries the agent pulled into context." },
+  plan: { title: "Context Plan", color: "#fb923c", icon: "pulse", side: "right", order: 2, content: false, blurb: "What Loom keeps, summarizes or drops to stay within the budget." },
+  budget: { title: "Token Budget", color: "#818cf8", icon: "gauge", side: "right", order: 3, content: false, blurb: "The token allowance for one request, the part that cannot be cut, and what the plan saves." },
+  waste: { title: "Reclaimable", color: "#fb7185", icon: "copy", side: "right", order: 4, content: false, blurb: "Older reads that a newer read of the same file has replaced. They are the first thing the plan drops." },
 };
 
 export const DECISION_COLOR: Record<Action, string> = { Keep: "#34d399", Summarize: "#fbbf24", Drop: "#f87171" };
@@ -30,6 +57,8 @@ export type Leaf = {
   color: string;
   /** "+N more": selecting it selects the whole hub. */
   more?: boolean;
+  /** Extra lines for the details panel (rules, explanations). */
+  notes?: string[];
 };
 
 export type Hub = {
@@ -39,10 +68,11 @@ export type Hub = {
   color: string;
   icon: IconName;
   side: "left" | "right";
-  slot: 0 | 1 | 2;
+  order: number;
   nodeIds: string[];
   tokens: number;
   leaves: Leaf[];
+  notes: string[];
 };
 
 export type Model = {
@@ -53,6 +83,8 @@ export type Model = {
   planById: Map<string, PlanItem>;
   edges: Edge[];
   total: number;
+  /** Tokens in context against the budget, for the gauge on the centre node. */
+  gauge: { used: number; budget: number; ratio: number; tone: "good" | "warn" | "bad" };
 };
 
 export type Selection =
@@ -67,6 +99,7 @@ export function inContext(nodes: NodeRow[], latest: number): NodeRow[] {
   return nodes.filter((n) => n.last_seen_turn === latest && n.status !== "DroppedByAgent");
 }
 
+/** The content hub a node belongs to. */
 export function hubOf(n: NodeRow): HubId {
   switch (n.kind) {
     case "System":
@@ -131,7 +164,22 @@ export function decisionOf(n: NodeRow, planById: Map<string, PlanItem>): Action 
   return d === "Summarize" && n.kind === "ToolCall" ? "Keep" : d;
 }
 
-function leavesFor(id: HubId, ns: NodeRow[], m: { callOf: Map<string, NodeRow>; planById: Map<string, PlanItem> }): Leaf[] {
+export function describeRule(r: Rule): string {
+  const m = r.matcher;
+  const when = [
+    m.kind && `kind is ${m.kind}`,
+    m.source_glob && `source matches ${m.source_glob}`,
+    m.min_tokens != null && `over ${m.min_tokens} tokens`,
+    m.older_than_turns != null && `older than ${m.older_than_turns} turns`,
+  ]
+    .filter(Boolean)
+    .join(" and ");
+  return `${when || "any node"} → ${r.action} (priority ${r.priority}${r.session_id ? "" : ", all sessions"})`;
+}
+
+type Ctx0 = { callOf: Map<string, NodeRow>; planById: Map<string, PlanItem> };
+
+function contentLeaves(id: HubId, ns: NodeRow[], m: Ctx0): Leaf[] {
   const color = HUB_META[id].color;
   const byPos = [...ns].sort((a, b) => a.position - b.position);
   const leaf = (n: NodeRow, label: string, sub: string): Leaf => ({ id: n.id, label, sub, nodeIds: [n.id], tokens: n.tokens, color });
@@ -182,80 +230,211 @@ function leavesFor(id: HubId, ns: NodeRow[], m: { callOf: Map<string, NodeRow>; 
           color,
         }));
     }
-    case "plan": {
-      const by: Record<Action, NodeRow[]> = { Keep: [], Summarize: [], Drop: [] };
-      for (const n of ns) by[decisionOf(n, m.planById)].push(n);
-      const names: Record<Action, string> = { Keep: "Kept", Summarize: "Summarized", Drop: "Dropped" };
-      return (["Keep", "Summarize", "Drop"] as Action[])
-        .filter((a) => by[a].length > 0)
-        .map((a) => ({
-          id: `decision:${a}`,
-          label: names[a],
-          sub: `${plural(by[a].length, "node")} · ${fmtTokens(sum(by[a]))}`,
-          nodeIds: by[a].map((n) => n.id),
-          tokens: sum(by[a]),
-          color: DECISION_COLOR[a],
-        }));
-    }
+    default:
+      return [];
   }
 }
 
-function subtitleFor(id: HubId, ns: NodeRow[], plan: Plan | null, _mode: string): string {
-  const t = compact(sum(ns));
-  switch (id) {
-    case "system":
-      return `${plural(ns.length, "prompt")} · ${t} tok`;
-    case "user":
-      return `${plural(ns.length, "message")} · ${t} tok`;
-    case "assistant":
-      return `${plural(ns.length, "reply", "replies")} · ${t} tok`;
-    case "tools":
-      return `${plural(ns.filter((n) => n.kind === "ToolCall").length, "call")} · ${t} tok`;
-    case "knowledge":
-      return `${plural(new Set(ns.map((n) => n.source ?? n.id)).size, "source")} · ${t} tok`;
-    case "plan":
-      return plan ? `${compact(plan.planned_tokens)} / ${compact(plan.budget)} tok` : "no plan yet";
-  }
-}
-
-export function buildModel(input: {
+export type BuildInput = {
   nodes: NodeRow[];
   edges: Edge[];
   plan: Plan | null;
   mode: string;
   latest: number;
-}): Model {
+  rules?: Rule[];
+  /** Effective token budget (0 when unknown). */
+  budget?: number;
+};
+
+export function buildModel(input: BuildInput): Model {
   const nodes = inContext(input.nodes, input.latest).sort((a, b) => a.position - b.position);
   const ids = new Set(nodes.map((n) => n.id));
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const edges = input.edges.filter((e) => ids.has(e.from) && ids.has(e.to));
-  const planById = new Map((input.plan?.items ?? []).map((i) => [i.id, i]));
+  const planItems = input.plan?.items ?? [];
+  const planById = new Map(planItems.map((i) => [i.id, i]));
   const callOf = new Map<string, NodeRow>();
   for (const e of edges) if (e.kind === "ToolPair" && byId.has(e.from)) callOf.set(e.to, byId.get(e.from)!);
+  const ctx0: Ctx0 = { callOf, planById };
+  const plan = input.plan;
+  const budget = input.budget ?? plan?.budget ?? 0;
+  const rules = input.rules ?? [];
+  const total = sum(nodes);
 
+  const hubs: Hub[] = [];
+  const add = (id: HubId, p: { subtitle: string; nodeIds: string[]; tokens: number; leaves: Leaf[]; notes?: string[] }) => {
+    const meta = HUB_META[id];
+    hubs.push({
+      id,
+      title: meta.title,
+      subtitle: p.subtitle,
+      color: meta.color,
+      icon: meta.icon,
+      side: meta.side,
+      order: meta.order,
+      nodeIds: p.nodeIds,
+      tokens: p.tokens,
+      leaves: capLeaves(p.leaves, meta.color),
+      notes: p.notes ?? [],
+    });
+  };
+
+  // ---- content hubs
   const groups = new Map<HubId, NodeRow[]>();
   for (const n of nodes) groups.set(hubOf(n), [...(groups.get(hubOf(n)) ?? []), n]);
-  if (nodes.length) groups.set("plan", nodes);
+  const t = (ns: NodeRow[]) => compact(sum(ns));
+  for (const id of ["system", "user", "tools", "assistant", "knowledge"] as HubId[]) {
+    const ns = groups.get(id) ?? [];
+    if (!ns.length) continue;
+    const subtitle = {
+      system: `${plural(ns.length, "prompt")} · ${t(ns)} tok`,
+      user: `${plural(ns.length, "message")} · ${t(ns)} tok`,
+      assistant: `${plural(ns.length, "reply", "replies")} · ${t(ns)} tok`,
+      tools: `${plural(ns.filter((n) => n.kind === "ToolCall").length, "call")} · ${t(ns)} tok`,
+      knowledge: `${plural(new Set(ns.map((n) => n.source ?? n.id)).size, "source")} · ${t(ns)} tok`,
+    }[id as "system" | "user" | "tools" | "assistant" | "knowledge"];
+    add(id, { subtitle, nodeIds: ns.map((n) => n.id), tokens: sum(ns), leaves: contentLeaves(id, ns, ctx0) });
+  }
 
-  const hubs: Hub[] = (Object.keys(HUB_META) as HubId[])
-    .filter((id) => (groups.get(id) ?? []).length > 0)
-    .map((id) => {
-      const ns = groups.get(id)!;
-      const meta = HUB_META[id];
-      return {
-        id,
-        title: meta.title,
-        subtitle: subtitleFor(id, ns, input.plan, input.mode),
-        color: meta.color,
-        icon: meta.icon,
-        side: meta.side,
-        slot: meta.slot,
-        nodeIds: ns.map((n) => n.id),
-        tokens: id === "plan" ? (input.plan?.planned_tokens ?? sum(ns)) : sum(ns),
-        leaves: capLeaves(leavesFor(id, ns, { callOf, planById }), meta.color),
-      };
+  // ---- your controls: pins, forced actions, rules
+  const pinned = nodes.filter((n) => n.pinned);
+  const forced = nodes.filter((n) => n.user_action);
+  if (pinned.length || forced.length || rules.length) {
+    const leaves: Leaf[] = [];
+    const color = HUB_META.controls.color;
+    if (pinned.length) leaves.push({ id: "pinned", label: "Pinned", sub: `${plural(pinned.length, "node")} · ${fmtTokens(sum(pinned))}`, nodeIds: pinned.map((n) => n.id), tokens: sum(pinned), color });
+    for (const a of ["Keep", "Summarize", "Drop"] as Action[]) {
+      const f = forced.filter((n) => n.user_action === a);
+      if (f.length) leaves.push({ id: `forced:${a}`, label: `Forced ${a}`, sub: `${plural(f.length, "node")} · ${fmtTokens(sum(f))}`, nodeIds: f.map((n) => n.id), tokens: sum(f), color });
+    }
+    if (rules.length) {
+      leaves.push({ id: "rules", label: plural(rules.length, "rule"), sub: "apply to this session", nodeIds: [], tokens: 0, color, notes: rules.map(describeRule) });
+    }
+    const covered = [...new Set([...pinned, ...forced].map((n) => n.id))];
+    add("controls", {
+      subtitle: `${pinned.length} pinned · ${plural(rules.length, "rule")}`,
+      nodeIds: covered,
+      tokens: sum([...pinned, ...forced.filter((n) => !n.pinned)]),
+      leaves,
+      notes: rules.map(describeRule),
     });
-  return { hubs, nodes, byId, planById, edges, total: sum(nodes) };
+  }
+
+  // ---- prompt cache: the unchanged start of the request
+  if (plan && nodes.length) {
+    const prefix = nodes.slice(0, Math.min(plan.cache_prefix_len, nodes.length));
+    const fresh = nodes.filter((n) => n.first_seen_turn === input.latest);
+    const color = HUB_META.cache.color;
+    const leaves: Leaf[] = [];
+    if (prefix.length) leaves.push({ id: "prefix", label: "Unchanged start", sub: `${plural(prefix.length, "node")} · ${fmtTokens(sum(prefix))}`, nodeIds: prefix.map((n) => n.id), tokens: sum(prefix), color });
+    if (fresh.length) leaves.push({ id: "fresh", label: "New this turn", sub: `${plural(fresh.length, "node")} · ${fmtTokens(sum(fresh))}`, nodeIds: fresh.map((n) => n.id), tokens: sum(fresh), color: "#e2e8f0" });
+    leaves.push({
+      id: "frozen",
+      label: plan.prefix_frozen ? "Decisions repeated" : "Not held fixed",
+      sub: plan.prefix_frozen ? "cache stays valid" : prefix.length ? "budget forces edits" : "nothing sent before",
+      nodeIds: [],
+      tokens: 0,
+      color: plan.prefix_frozen ? "#34d399" : "#94a3b8",
+      notes: [
+        plan.prefix_frozen
+          ? "Loom repeats what it did to the unchanged start of the request last call, so the provider's prompt cache keeps working."
+          : prefix.length
+            ? "The budget does not leave room to keep the old decisions, so the start of the request will change and the provider cache restarts."
+            : "This is the first request of the session, so there is no earlier prefix to protect.",
+      ],
+    });
+    add("cache", {
+      subtitle: `${plan.cache_prefix_len} unchanged · ${fresh.length} new`,
+      nodeIds: nodes.map((n) => n.id),
+      tokens: sum(prefix),
+      leaves,
+    });
+  }
+
+  // ---- plan: what happens to each node
+  if (nodes.length) {
+    const by: Record<Action, NodeRow[]> = { Keep: [], Summarize: [], Drop: [] };
+    for (const n of nodes) by[decisionOf(n, planById)].push(n);
+    const names: Record<Action, string> = { Keep: "Kept", Summarize: "Summarized", Drop: "Dropped" };
+    const leaves = (["Keep", "Summarize", "Drop"] as Action[])
+      .filter((a) => by[a].length > 0)
+      .map((a) => {
+        const after = a === "Summarize" ? by[a].reduce((s, n) => s + (planById.get(n.id)?.planned_tokens ?? n.tokens), 0) : null;
+        return {
+          id: `decision:${a}`,
+          label: names[a],
+          sub: `${plural(by[a].length, "node")} · ${after != null ? `${compact(sum(by[a]))}→${compact(after)}` : fmtTokens(sum(by[a]))}`,
+          nodeIds: by[a].map((n) => n.id),
+          tokens: sum(by[a]),
+          color: DECISION_COLOR[a],
+        };
+      });
+    add("plan", {
+      subtitle: `${by.Keep.length} keep · ${by.Summarize.length} sum · ${by.Drop.length} drop`,
+      nodeIds: nodes.map((n) => n.id),
+      tokens: plan?.planned_tokens ?? total,
+      leaves,
+    });
+  }
+
+  // ---- budget
+  if (plan && nodes.length) {
+    const over = plan.over_budget; // the policy's own flag is the single source of truth
+    const required = nodes.filter((n) => planById.get(n.id)?.required);
+    const saved = plan.original_tokens - plan.planned_tokens;
+    const color = HUB_META.budget.color;
+    const kept = nodes.filter((n) => decisionOf(n, planById) !== "Drop");
+    const cut = nodes.filter((n) => decisionOf(n, planById) !== "Keep");
+    add("budget", {
+      subtitle: `${compact(plan.planned_tokens)} / ${compact(plan.budget)} tok`,
+      nodeIds: nodes.map((n) => n.id),
+      tokens: plan.planned_tokens,
+      leaves: [
+        { id: "floor", label: "Required floor", sub: `${fmtTokens(plan.must_tokens)} tokens`, nodeIds: required.map((n) => n.id), tokens: plan.must_tokens, color: over ? "#f87171" : color },
+        { id: "planned", label: over ? "Over budget" : "Planned", sub: `${fmtTokens(plan.planned_tokens)} of ${fmtTokens(plan.budget)}`, nodeIds: kept.map((n) => n.id), tokens: plan.planned_tokens, color: over ? "#f87171" : "#34d399" },
+        {
+          id: "saved",
+          label: saved > 0 ? "Saved" : "Nothing to save",
+          sub: saved > 0 ? `${fmtTokens(saved)} · ${Math.round((saved / Math.max(1, plan.original_tokens)) * 100)}%` : "fits as is",
+          nodeIds: cut.map((n) => n.id),
+          tokens: Math.max(0, saved),
+          color: saved > 0 ? "#fbbf24" : "#94a3b8",
+        },
+      ],
+    });
+  }
+
+  // ---- reclaimable: older versions that a newer read replaced
+  const supersededSet = new Set(edges.filter((e) => e.kind === "Supersedes").map((e) => e.to));
+  const old = nodes.filter((n) => supersededSet.has(n.id)).sort((a, b) => b.tokens - a.tokens);
+  if (old.length) {
+    const newerOf = new Map(edges.filter((e) => e.kind === "Supersedes").map((e) => [e.to, e.from]));
+    add("waste", {
+      subtitle: `${plural(old.length, "older read")} · ${compact(sum(old))} tok`,
+      nodeIds: old.map((n) => n.id),
+      tokens: sum(old),
+      leaves: old.map((n) => ({
+        id: n.id,
+        label: shorten(n.source ? basename(n.source) : n.preview || n.kind, 20),
+        sub: `replaced${byId.get(newerOf.get(n.id) ?? "") ? ` by turn ${byId.get(newerOf.get(n.id)!)!.first_seen_turn + 1}` : ""} · ${fmtTokens(n.tokens)}`,
+        nodeIds: [n.id],
+        tokens: n.tokens,
+        color: HUB_META.waste.color,
+      })),
+    });
+  }
+
+  const gaugeBudget = budget || plan?.budget || 0;
+  const ratio = gaugeBudget ? total / gaugeBudget : 0;
+  return {
+    hubs: hubs.sort((a, b) => a.order - b.order),
+    nodes,
+    byId,
+    planById,
+    edges,
+    total,
+    gauge: { used: total, budget: gaugeBudget, ratio, tone: ratio > 1 ? "bad" : ratio > 0.8 ? "warn" : "good" },
+  };
 }
 
 // ------------------------------------------------------------------ insights
@@ -304,15 +483,51 @@ export function centerInsights(m: Model, c: Ctx): Insight[] {
   return out.slice(0, 5);
 }
 
-export function hubInsights(h: Hub, m: Model): Insight[] {
+export function hubInsights(h: Hub, m: Model, c?: Ctx): Insight[] {
   const ns = h.nodeIds.map((id) => m.byId.get(id)!).filter(Boolean);
   const out: Insight[] = [];
-  const share = m.total ? Math.round((sum(ns) / m.total) * 100) : 0;
-  if (h.id === "plan") {
-    out.push({ text: h.subtitle });
-    for (const l of h.leaves) out.push({ text: `${l.label}: ${l.sub}`, tone: l.label === "Dropped" ? "warn" : "good" });
-    return out;
+  const plan = c?.plan ?? null;
+  switch (h.id) {
+    case "plan": {
+      out.push({ text: h.subtitle });
+      for (const l of h.leaves) out.push({ text: `${l.label}: ${l.sub}`, tone: l.label === "Dropped" ? "warn" : "good" });
+      return out;
+    }
+    case "budget": {
+      if (!plan) return [{ text: "No plan yet" }];
+      out.push({ text: `Budget ${fmtTokens(plan.budget)} tokens; the plan uses ${fmtTokens(plan.planned_tokens)}`, tone: plan.over_budget ? "bad" : "good" });
+      out.push({ text: `Required floor: ${fmtTokens(plan.must_tokens)} tokens that cannot be removed (system prompt, pins, latest message, recent context)` });
+      const saved = plan.original_tokens - plan.planned_tokens;
+      out.push({ text: saved > 0 ? `${fmtTokens(saved)} tokens saved (${Math.round((saved / Math.max(1, plan.original_tokens)) * 100)}%)` : "Nothing needs to be cut", tone: saved > 0 ? "good" : undefined });
+      if (plan.over_budget) out.push({ text: "Required items alone exceed the budget: unpin something or raise it", tone: "bad" });
+      return out;
+    }
+    case "cache": {
+      if (!plan) return [];
+      out.push({ text: `${plural(plan.cache_prefix_len, "node")} at the start were sent unchanged last call` });
+      out.push({
+        text: plan.prefix_frozen ? "Their decisions are repeated, so the provider's prompt cache stays valid" : "Not held fixed: nothing to protect, or the budget forces edits",
+        tone: plan.prefix_frozen ? "good" : "warn",
+      });
+      return out;
+    }
+    case "controls": {
+      const pinned = ns.filter((n) => n.pinned);
+      if (pinned.length) out.push({ text: `${plural(pinned.length, "node")} pinned: ${fmtTokens(sum(pinned))} tokens sent on every call` });
+      const forced = ns.filter((n) => n.user_action);
+      if (forced.length) out.push({ text: `${plural(forced.length, "node")} with a forced action` });
+      for (const note of h.notes.slice(0, 3)) out.push({ text: note });
+      return out.length ? out : [{ text: "Nothing pinned or forced" }];
+    }
+    case "waste": {
+      out.push({ text: `${fmtTokens(sum(ns))} tokens sit in ${plural(ns.length, "older read")} that newer reads replaced`, tone: "warn" });
+      out.push({ text: "The plan drops these first when the budget is tight" });
+      return out;
+    }
+    default:
+      break;
   }
+  const share = m.total ? Math.round((sum(ns) / m.total) * 100) : 0;
   out.push({ text: `${plural(ns.length, "node")}, ${fmtTokens(sum(ns))} tokens (${share}% of the context)` });
   const big = largest(ns);
   if (big && ns.length > 1) out.push({ text: `Largest: ${nodeLabel(big)} (${fmtTokens(big.tokens)} tokens)` });
@@ -324,8 +539,8 @@ export function hubInsights(h: Hub, m: Model): Insight[] {
   const pinned = ns.filter((n) => n.pinned).length;
   if (pinned) out.push({ text: `${plural(pinned, "node")} pinned` });
   const sup = supersededIds(m);
-  const old = ns.filter((n) => sup.has(n.id)).length;
-  if (old) out.push({ text: `${plural(old, "node")} superseded by a newer version`, tone: "warn" });
+  const stale = ns.filter((n) => sup.has(n.id)).length;
+  if (stale) out.push({ text: `${plural(stale, "node")} superseded by a newer version`, tone: "warn" });
   return out.slice(0, 5);
 }
 
@@ -357,7 +572,7 @@ export function related(sel: Selection, m: Model): Related[] {
   switch (sel.kind) {
     case "center":
       return m.hubs
-        .filter((h) => h.id !== "plan")
+        .filter((h) => HUB_META[h.id].content)
         .map((h) => ({
           key: h.id,
           label: h.title,
@@ -369,12 +584,13 @@ export function related(sel: Selection, m: Model): Related[] {
     case "hub": {
       const h = m.hubs.find((x) => x.id === sel.id);
       if (!h) return [];
+      const bySize = h.id === "budget" || h.id === "cache" || h.id === "waste";
       return h.nodeIds
         .map((id) => m.byId.get(id)!)
         .filter(Boolean)
-        .sort((a, b) => (m.planById.get(b.id)?.score ?? 0) - (m.planById.get(a.id)?.score ?? 0))
+        .sort((a, b) => (bySize ? b.tokens - a.tokens : (m.planById.get(b.id)?.score ?? 0) - (m.planById.get(a.id)?.score ?? 0)))
         .slice(0, 6)
-        .map((n) => relatedNode(n, (m.planById.get(n.id)?.score ?? n.score).toFixed(2)));
+        .map((n) => relatedNode(n, bySize ? `${fmtTokens(n.tokens)} tok` : (m.planById.get(n.id)?.score ?? n.score).toFixed(2)));
     }
     case "leaf": {
       const l = m.hubs.find((x) => x.id === sel.hub)?.leaves.find((x) => x.id === sel.leaf);

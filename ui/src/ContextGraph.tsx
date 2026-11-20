@@ -32,7 +32,7 @@ const SUBS: [Sub, string, "graph" | "layers" | "clock"][] = [
 ];
 
 function Layers({ model, ctx, onPick }: { model: Model; ctx: Ctx; onPick: (s: Selection) => void }) {
-  const hubs = model.hubs.filter((h) => h.id !== "plan");
+  const hubs = model.hubs.filter((h) => HUB_META[h.id].content);
   const over = ctx.budget > 0 && model.total > ctx.budget;
   const heavy = [...model.nodes].sort((a, b) => b.tokens - a.tokens).slice(0, 8);
   return (
@@ -109,6 +109,7 @@ export default function ContextGraph({
   connected: boolean;
 }) {
   const graph = useLoad(() => api.graph(sessionId), [sessionId, tick]);
+  const rules = useLoad(() => api.rules(sessionId), [sessionId, tick]);
   const [sub, setSub] = useState<Sub>("graph");
   const [selection, setSelection] = useState<Selection>({ kind: "center" });
   const [query, setQuery] = useState("");
@@ -125,8 +126,17 @@ export default function ContextGraph({
 
   const mode = plan?.mode ?? session?.mode ?? "Observe";
   const model = useMemo(
-    () => buildModel({ nodes: graph.data?.nodes ?? [], edges: graph.data?.edges ?? [], plan: plan?.plan ?? null, mode, latest }),
-    [graph.data, plan, mode, latest],
+    () =>
+      buildModel({
+        nodes: graph.data?.nodes ?? [],
+        edges: graph.data?.edges ?? [],
+        plan: plan?.plan ?? null,
+        mode,
+        latest,
+        rules: rules.data ?? [],
+        budget: plan?.budget_tokens,
+      }),
+    [graph.data, rules.data, plan, mode, latest],
   );
   const ctx: Ctx = { budget: plan?.budget_tokens ?? 0, plan: plan?.plan ?? null, mode, latest };
   const title = session?.name ?? sessionId;

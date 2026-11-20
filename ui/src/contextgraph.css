@@ -66,7 +66,7 @@
 }
 .cg-pop label { display: flex; align-items: center; gap: 8px; padding: 6px 8px; font-size: 13px; cursor: pointer; }
 
-.cg-body { display: grid; grid-template-columns: minmax(0, 1fr) 330px; height: 620px; }
+.cg-body { display: grid; grid-template-columns: minmax(0, 1fr) 330px; height: 720px; }
 .cg-body.one { display: block; height: auto; padding: 18px 20px; }
 
 /* ---- the map ---- */
@@ -205,3 +205,7 @@
   .cg-card, .cg-links g { transition: none; }
   .cg-card:hover { transform: none; }
 }
+
+/* gauge on the centre node: tokens in context against the budget */
+.cg-gauge { position: absolute; left: 16px; right: 16px; bottom: 8px; height: 4px; border-radius: 2px; background: #16203a; overflow: hidden; }
+.cg-gauge i { display: block; height: 100%; border-radius: 2px; transition: width 0.3s; }
