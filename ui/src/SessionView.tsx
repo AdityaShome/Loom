@@ -1,15 +1,13 @@
-import { lazy, Suspense, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { api } from "./api";
 import { useLive, useLoad } from "./hooks";
 import { fmtTokens } from "./format";
 import BudgetBar from "./BudgetBar";
+import ContextGraph from "./ContextGraph";
 import ContextList from "./ContextList";
 import PlanView from "./PlanView";
 import RulesView from "./RulesView";
 import TurnDiff from "./TurnDiff";
-
-// Cytoscape is large; load it only when the Graph tab opens.
-const GraphView = lazy(() => import("./GraphView"));
 
 type Tab = "context" | "plan" | "graph" | "rules" | "diff";
 const TABS: [Tab, string][] = [
@@ -88,9 +86,15 @@ export default function SessionView({ id }: { id: string }) {
           <p className={plan.error ? "error" : "muted"}>{plan.error ?? "Loading…"}</p>
         ))}
       {tab === "graph" && (
-        <Suspense fallback={<p className="muted">Loading graph…</p>}>
-          <GraphView sessionId={id} tick={tick} latest={latest} />
-        </Suspense>
+        <ContextGraph
+          sessionId={id}
+          session={session}
+          plan={plan.data}
+          turns={turns.data}
+          latest={latest}
+          tick={tick}
+          connected={connected}
+        />
       )}
       {tab === "rules" && <RulesView sessionId={id} tick={tick} />}
       {tab === "diff" && <TurnDiff sessionId={id} turns={turns.data} nodes={nodes.data} />}

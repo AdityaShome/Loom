@@ -46,7 +46,7 @@ a:hover { text-decoration: underline; }
 code { font: 12px ui-monospace, Consolas, monospace; }
 .muted { color: var(--muted); }
 .error { color: var(--bad); }
-.app { max-width: 1100px; margin: 0 auto; padding: 0 16px 48px; }
+.app { max-width: 1400px; margin: 0 auto; padding: 0 16px 48px; }
 .top { display: flex; align-items: baseline; gap: 12px; padding: 16px 0; border-bottom: 1px solid var(--line); }
 .brand { font-size: 20px; font-weight: 700; color: var(--text); }
 main { padding-top: 16px; }

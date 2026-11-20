@@ -15,7 +15,7 @@ It works with any agent framework without code changes: point the agent's base U
 - **Modes.** `Observe` records only. `Suggest` also shows the plan and prepares summaries, but still sends the original request. `Enforce` rewrites the request: dropped nodes are removed, summarized tool results and messages are replaced by short summaries, and the result is validated (role order, tool call/result pairing) before sending. If anything fails, or the plan changes nothing, the original request is sent unchanged.
 - **Summaries.** Produced by a model you configure, cached by content hash, and generated in the background: a request never waits longer than `LOOM_SUMMARIZER_TIMEOUT_MS` (default 300 ms). A summary that is not ready is skipped for that call (the node is kept if it fits, else dropped) and used on the next one.
 - **Prompt-cache friendly.** Decisions for the part of the request that was already sent are repeated, so the provider's prompt cache stays valid, unless the budget forces changes.
-- **Web UI** served by the same binary: sessions, context list with per-node controls (pin, importance, forced action, restore), plan preview, graph, rules editor, and a turn-to-turn diff. Updates arrive live over a WebSocket.
+- **Web UI** served by the same binary: sessions, context list with per-node controls (pin, importance, forced action, restore), plan preview, a context graph (a hub-and-spoke map of what the model sees, a per-layer token breakdown, and a per-turn timeline), rules editor, and a turn-to-turn diff. Updates arrive live over a WebSocket.
 
 Token counts are estimates (about 1 token per 4 characters). Plans use real summary sizes once a summary exists and estimates before that.
 
@@ -120,7 +120,7 @@ examples/        agent.py: a tiny tool-using agent for trying Loom with any Open
 ```sh
 cargo test                 # Rust unit, property and integration tests
 cd ui && npm run dev       # UI dev server on :5173, proxies /api and /ws to :7070
-cd ui && npm run typecheck
+cd ui && npm run typecheck && npm test   # UI type check and unit tests
 cargo clippy --all-targets -- -D warnings && cargo fmt --check   # what CI runs
 ```
 

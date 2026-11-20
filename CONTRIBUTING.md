@@ -21,7 +21,7 @@ CI runs the same checks:
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-(cd ui && npm run typecheck && npm run build)
+(cd ui && npm run typecheck && npm test && npm run build)
 ```
 
 `cargo fmt` fixes formatting (settings are in `rustfmt.toml`).
