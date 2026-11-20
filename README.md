@@ -121,9 +121,22 @@ examples/        agent.py: a tiny tool-using agent for trying Loom with any Open
 cargo test                 # Rust unit, property and integration tests
 cd ui && npm run dev       # UI dev server on :5173, proxies /api and /ws to :7070
 cd ui && npm run typecheck
+cargo clippy --all-targets -- -D warnings && cargo fmt --check   # what CI runs
 ```
 
 Run `loom` on `:7070` first when using the UI dev server. In debug builds the binary serves `ui/dist` from disk, so rebuild the UI with `npm run build` to see changes there. Release builds embed `ui/dist`, so build the UI before `cargo build --release`.
+
+## Performance
+
+Measured with `cargo run --release -p loom-server --example bench` on a laptop (Windows, SQLite file on local disk), against an upstream that answers instantly, so the numbers are what Loom itself adds. Each request carries N messages, the last two new, like an agent turn. Median added latency:
+
+| messages | Observe | Enforce, nothing to change | Enforce, rewriting about half |
+|---:|---:|---:|---:|
+| 10 | +0.1 ms | +3.3 ms | +3.6 ms |
+| 100 | +0.2 ms | +5.8 ms | +7.0 ms |
+| 1000 | +0.8 ms | +41 ms | +52 ms |
+
+Observe records in the background, so it barely touches the request. Enforce does its work before forwarding (record, plan, rewrite, validate), so its cost scales with the number of nodes. Summarizing never adds to this: summaries are generated in the background and applied on a later call. Run the benchmark yourself for your hardware; `RUST_LOG=loom_server::enforce=debug` logs a per-phase breakdown.
 
 ## Privacy and security
 
@@ -137,7 +150,7 @@ Run `loom` on `:7070` first when using the UI dev server. In debug builds the bi
 
 - Enforce has only been exercised against small local models and fake upstreams, not against the Anthropic or OpenAI APIs.
 - Tool-call arguments are never summarized (only results and messages are), and no marker is left where nodes were dropped.
-- The per-request cost of Enforce (ingest, plan, rewrite) is not benchmarked; it measured about 20 ms in a debug build.
+- Enforce adds latency that grows with context size (see Performance). It is small next to model latency, but it is real.
 - Token counts are rough estimates.
 - Relevance scoring is keyword overlap with the latest user message.
 - Relation detection links file paths and tool pairs only; URLs and error codes are not matched yet.

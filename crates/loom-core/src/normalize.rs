@@ -9,6 +9,8 @@ use crate::model::{CanonMsg, Loc, NodeKind, Provider, Role};
 pub struct Normalized {
     pub model: Option<String>,
     pub msgs: Vec<CanonMsg>,
+    /// The parsed request body, so callers need not parse it again.
+    pub raw: Value,
 }
 
 pub fn normalize(provider: Provider, body: &[u8]) -> Result<Normalized, String> {
@@ -20,7 +22,7 @@ pub fn normalize(provider: Provider, body: &[u8]) -> Result<Normalized, String> 
     }
     .ok_or("missing messages array")?;
     classify(&mut msgs);
-    Ok(Normalized { model, msgs })
+    Ok(Normalized { model, msgs, raw: v })
 }
 
 fn msg(role: Role, kind: NodeKind, content: String, loc: Loc) -> CanonMsg {

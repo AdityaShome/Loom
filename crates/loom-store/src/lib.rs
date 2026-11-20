@@ -189,23 +189,18 @@ impl Store {
         let mut ids = Vec::with_capacity(msgs.len());
         let (mut new, mut tokens) = (0usize, 0u32);
         let mut new_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Request position -> id of the node already stored there (null for new nodes), updated in one statement.
+        let mut known_by_position: Vec<Option<String>> = Vec::with_capacity(msgs.len());
         for (i, ((m, h), (o, mt))) in msgs.iter().zip(&hashes).zip(occs.iter().zip(matches)).enumerate() {
             let t = count_tokens(&m.content) + overhead;
             tokens += t;
             match mt {
                 Match::Existing(id) => {
-                    sqlx::query(
-                        // Status is recomputed every request: Full unless Enforce rewrites it below.
-                        "UPDATE nodes SET last_seen_turn = ?, position = ?, status = 'Full' WHERE id = ?",
-                    )
-                    .bind(turn)
-                    .bind(i as i64)
-                    .bind(&id)
-                    .execute(&mut *tx)
-                    .await?;
+                    known_by_position.push(Some(id.clone()));
                     ids.push(id);
                 }
                 Match::New => {
+                    known_by_position.push(None);
                     let id = ulid::Ulid::new().to_string();
                     sqlx::query(
                         "INSERT INTO nodes (id, session_id, content_hash, occ, kind, role, content, tokens,
@@ -232,6 +227,17 @@ impl Store {
                 }
             }
         }
+
+        // Nodes seen again: refresh turn, position and status in ONE statement (cost does not grow with the
+        // number of statements per node). Status is recomputed every request: Full unless Enforce rewrites it.
+        sqlx::query(
+            "UPDATE nodes SET last_seen_turn = ?1, status = 'Full', position = m.key
+             FROM json_each(?2) AS m WHERE nodes.id = m.value",
+        )
+        .bind(turn)
+        .bind(serde_json::to_string(&known_by_position)?)
+        .execute(&mut *tx)
+        .await?;
 
         // Relations among the nodes of this request; only edges touching new nodes are written.
         let gnodes: Vec<GNode> = msgs
@@ -577,6 +583,16 @@ impl Store {
     /// of the latest request (in order), their edges, settings, rules, cached
     /// summaries, and what was sent for each node last call.
     pub async fn policy_data(&self, session_id: &str) -> Result<Option<PolicyData>> {
+        self.policy_data_inner(session_id, None).await
+    }
+
+    /// Same, for the request that was just ingested: node text comes from `msgs` (already in memory)
+    /// instead of being read back from the database.
+    pub async fn policy_data_for_request(&self, session_id: &str, msgs: &[CanonMsg]) -> Result<Option<PolicyData>> {
+        self.policy_data_inner(session_id, Some(msgs)).await
+    }
+
+    async fn policy_data_inner(&self, session_id: &str, msgs: Option<&[CanonMsg]>) -> Result<Option<PolicyData>> {
         let Some(settings) = self.session_settings(session_id).await? else { return Ok(None) };
         let latest: Option<i64> = sqlx::query_scalar("SELECT MAX(idx) FROM turns WHERE session_id = ?")
             .bind(session_id)
@@ -584,9 +600,15 @@ impl Store {
             .await?;
         let Some(latest) = latest else { return Ok(None) };
 
-        let nodes: Vec<Node> = sqlx::query(
-            "SELECT * FROM nodes WHERE session_id = ? AND last_seen_turn = ? AND status != 'DroppedByAgent' ORDER BY position",
-        )
+        // Skip the (large) content column when the caller already has the text.
+        let columns = if msgs.is_some() {
+            "id, session_id, content_hash, occ, kind, role, '' AS content, tokens, first_seen_turn, last_seen_turn,              position, source, importance, pinned, locked, user_action, status, summary_node, score"
+        } else {
+            "*"
+        };
+        let mut nodes: Vec<Node> = sqlx::query(&format!(
+            "SELECT {columns} FROM nodes WHERE session_id = ? AND last_seen_turn = ? AND status != 'DroppedByAgent' ORDER BY position"
+        ))
         .bind(session_id)
         .bind(latest)
         .fetch_all(&self.pool)
@@ -594,6 +616,14 @@ impl Store {
         .iter()
         .map(node_from_row)
         .collect::<Result<_>>()?;
+        if let Some(msgs) = msgs {
+            for n in &mut nodes {
+                n.content = msgs
+                    .get(n.position as usize)
+                    .map(|m| m.content.clone())
+                    .ok_or_else(|| anyhow!("node position outside the request"))?;
+            }
+        }
 
         let present: std::collections::HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
         let edges: Vec<Edge> = self
@@ -736,15 +766,18 @@ impl Store {
         .bind(turn as i64)
         .execute(&mut *tx)
         .await?;
-        for (id, a) in decisions {
-            let status = match a {
-                Action::Keep => Status::Full,
-                Action::Summarize => Status::Summarized,
-                Action::Drop => Status::Dropped,
-            };
-            sqlx::query("UPDATE nodes SET status = ? WHERE id = ?")
-                .bind(status.as_str())
-                .bind(id)
+        // Ingest already reset every node to Full; only the rewritten ones need a new status.
+        let changed: HashMap<&str, &str> = decisions
+            .iter()
+            .filter_map(|(id, a)| match a {
+                Action::Keep => None,
+                Action::Summarize => Some((id.as_str(), Status::Summarized.as_str())),
+                Action::Drop => Some((id.as_str(), Status::Dropped.as_str())),
+            })
+            .collect();
+        if !changed.is_empty() {
+            sqlx::query("UPDATE nodes SET status = m.value FROM json_each(?1) AS m WHERE nodes.id = m.key")
+                .bind(serde_json::to_string(&changed)?)
                 .execute(&mut *tx)
                 .await?;
         }

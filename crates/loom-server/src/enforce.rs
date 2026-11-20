@@ -12,7 +12,6 @@ use loom_core::{
     rewrite::{rewrite, validate_request},
 };
 use loom_store::Store;
-use serde_json::Value;
 use tokio::sync::broadcast::Sender;
 
 use crate::{
@@ -41,7 +40,9 @@ pub async fn enforce(
     body: &Bytes,
     creds: &Creds,
 ) -> Result<Enforced> {
+    let t0 = std::time::Instant::now();
     let norm = normalize(provider, body).map_err(|e| anyhow!("unparseable body: {e}"))?;
+    let t_norm = t0.elapsed();
     let ingested = store.ingest(session, provider, norm.model.as_deref(), &norm.msgs).await?;
     let _ = events.send(Event {
         session: session.to_string(),
@@ -52,7 +53,9 @@ pub async fn enforce(
         tokens: ingested.tokens,
     });
 
-    let mut data = store.policy_data(session).await?.ok_or_else(|| anyhow!("session has no turns"))?;
+    let t_ingest = t0.elapsed();
+    let mut data =
+        store.policy_data_for_request(session, &norm.msgs).await?.ok_or_else(|| anyhow!("session has no turns"))?;
     ensure!(
         data.input.nodes.len() == norm.msgs.len(),
         "stored nodes ({}) do not match the request ({})",
@@ -63,6 +66,8 @@ pub async fn enforce(
         data.input.nodes.iter().zip(&norm.msgs).all(|(n, m)| n.kind == m.kind),
         "stored nodes do not line up with the request"
     );
+
+    let t_load = t0.elapsed();
 
     // Plan; generate summaries for anything the plan wants summarized and does not have yet.
     // Summaries that are not ready in time continue in the background for the next call.
@@ -118,6 +123,7 @@ pub async fn enforce(
         }
     }
     let plan = final_plan.ok_or_else(|| anyhow!("plan did not settle"))?;
+    let t_plan = t0.elapsed();
     validate_plan(&data.input, &plan).map_err(|e| anyhow!("invalid plan: {e}"))?;
 
     let decisions: Vec<(String, Action)> = plan.items.iter().map(|i| (i.id.clone(), i.decision)).collect();
@@ -141,15 +147,25 @@ pub async fn enforce(
         });
     }
 
-    let original: Value = serde_json::from_slice(body)?;
     let rewritten =
-        rewrite(provider, &original, &norm.msgs, &plan, &data.summaries).map_err(|e| anyhow!("rewrite failed: {e}"))?;
+        rewrite(provider, &norm.raw, &norm.msgs, &plan, &data.summaries).map_err(|e| anyhow!("rewrite failed: {e}"))?;
     validate_request(provider, &rewritten).map_err(|e| anyhow!("rewritten request is invalid: {e}"))?;
     let bytes = Bytes::from(serde_json::to_vec(&rewritten)?);
     if bytes.len() >= body.len() {
         bail!("rewritten request is not smaller ({} >= {} bytes)", bytes.len(), body.len());
     }
+    let t_rewrite = t0.elapsed();
     store.record_enforced(session, ingested.turn, &decisions, plan.planned_tokens).await?;
+    tracing::debug!(
+        normalize_us = t_norm.as_micros() as u64,
+        ingest_us = (t_ingest - t_norm).as_micros() as u64,
+        load_us = (t_load - t_ingest).as_micros() as u64,
+        plan_us = (t_plan - t_load).as_micros() as u64,
+        rewrite_us = (t_rewrite - t_plan).as_micros() as u64,
+        record_us = (t0.elapsed() - t_rewrite).as_micros() as u64,
+        nodes = data.input.nodes.len(),
+        "enforce timings"
+    );
     Ok(Enforced {
         body: Some(bytes),
         original_tokens: ingested.tokens,
