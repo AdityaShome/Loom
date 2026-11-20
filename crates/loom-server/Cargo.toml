@@ -28,3 +28,4 @@ tracing-subscriber.workspace = true
 axum.workspace = true
 futures-util.workspace = true
 reqwest = { workspace = true, features = ["stream", "json"] }
+sqlx.workspace = true
