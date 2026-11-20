@@ -104,8 +104,8 @@ def run_tool(root: str, name: str, args: dict) -> str:
         return f"error: {e}"
 
 
-def chat(base_url: str, model: str, session: str, messages: list) -> dict:
-    body = json.dumps({"model": model, "messages": messages, "tools": TOOLS, "stream": False}).encode()
+def chat(base_url: str, model: str, session: str, messages: list, extra: dict) -> dict:
+    body = json.dumps({"model": model, "messages": messages, "tools": TOOLS, "stream": False, **extra}).encode()
     req = urllib.request.Request(
         base_url.rstrip("/") + "/chat/completions",
         data=body,
@@ -132,9 +132,15 @@ def main() -> None:
     ap.add_argument("--session", default="qwen-demo", help="session name shown in the Loom UI")
     ap.add_argument("--root", default=".", help="project directory the tools may read")
     ap.add_argument("--max-steps", type=int, default=15)
+    ap.add_argument(
+        "--reasoning",
+        help="reasoning_effort to send (e.g. none, low). Default: none for Qwen3 models, whose thinking can take minutes on small GPUs; nothing otherwise.",
+    )
     a = ap.parse_args()
 
     root = os.path.realpath(a.root)
+    effort = a.reasoning or ("none" if "qwen3" in a.model.lower() else None)
+    extra = {"reasoning_effort": effort} if effort else {}
     messages = [
         {
             "role": "system",
@@ -145,7 +151,7 @@ def main() -> None:
     ]
 
     for step in range(1, a.max_steps + 1):
-        msg = chat(a.base_url, a.model, a.session, messages)["choices"][0]["message"]
+        msg = chat(a.base_url, a.model, a.session, messages, extra)["choices"][0]["message"]
         calls = msg.get("tool_calls") or []
         messages.append({k: v for k, v in msg.items() if k in ("role", "content", "tool_calls") and v is not None})
         if not calls:
