@@ -36,6 +36,7 @@ pub fn routes() -> Router<Arc<State>> {
         .route("/api/nodes/{id}/restore", post(restore_node))
         .route("/api/rules", get(list_rules).post(create_rule))
         .route("/api/rules/{id}", put(update_rule).delete(delete_rule))
+        .merge(crate::knowledge_api::routes())
 }
 
 async fn turns(AxState(st): AxState<Arc<State>>, Path(id): Path<String>) -> Response {
@@ -163,6 +164,8 @@ struct PlanResponse {
     /// 0 in settings means "model default"; this is the budget actually used.
     budget_tokens: u32,
     budget_is_default: bool,
+    /// Tokens of your notes, already taken out of `budget_tokens` (Enforce adds them to every request).
+    notes_tokens: u32,
     weights: Weights,
     /// Edits made since the last model call; they apply to the next one.
     pending_changes: bool,
@@ -179,14 +182,17 @@ struct SummarizerInfo {
 async fn plan(AxState(st): AxState<Arc<State>>, Path(id): Path<String>) -> Response {
     let Some(store) = &st.store else { return unavailable() };
     let res: anyhow::Result<Option<PlanResponse>> = async {
-        let (Some(inp), Some(settings)) = (store.policy_input(&id).await?, store.session_settings(&id).await?) else {
+        let (Some(data), Some(settings)) = (store.policy_data(&id).await?, store.session_settings(&id).await?) else {
             return Ok(None);
         };
+        let notes_tokens = data.memory_tokens;
+        let inp = data.input;
         Ok(Some(PlanResponse {
             plan: policy::plan(&inp),
             mode: settings.mode,
             budget_tokens: inp.budget,
             budget_is_default: settings.budget_tokens <= 0,
+            notes_tokens,
             weights: inp.weights,
             pending_changes: store.pending_changes(&id).await?,
             summarizer: st
