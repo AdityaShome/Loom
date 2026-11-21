@@ -12,6 +12,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location("agent", os.path.join(HERE, "agent.py"))
 agent = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(agent)
+sb_spec = importlib.util.spec_from_file_location("sandbox", os.path.join(HERE, "sandbox.py"))
+sandbox = importlib.util.module_from_spec(sb_spec)
+sb_spec.loader.exec_module(sandbox)
 
 
 def names(tools):
@@ -178,6 +181,71 @@ class Commands(Sandbox):
         out = self.run_tool("run_command", {"command": "git log"}, run=True)  # no commits yet: non-zero, reported not raised
         self.assertTrue(out.startswith("exit code"), out)
         self.assertNotIn("exit code 0", out.splitlines()[0])
+
+
+class SandboxScript(unittest.TestCase):
+    def setUp(self):
+        self.base = tempfile.mkdtemp()
+        self.path = os.path.join(self.base, "box")
+
+    def tearDown(self):
+        sandbox.remove_tree(self.base)
+
+    @unittest.skipUnless(shutil.which("git"), "git is not installed")
+    def test_creates_a_project_with_history_and_a_marker(self):
+        full = sandbox.create(self.path)
+        for rel in ["notes.md", "package.json", "src/math.js", "test/math.test.js", ".loom-sandbox"]:
+            self.assertTrue(os.path.exists(os.path.join(full, rel)), rel)
+        log = subprocess.run(["git", "log", "--oneline"], cwd=full, capture_output=True, text=True).stdout
+        self.assertIn("Initial sandbox project", log)
+        status = subprocess.run(["git", "status", "--short"], cwd=full, capture_output=True, text=True).stdout
+        self.assertEqual(status.strip(), "", "starts clean, so every later change is the agent's")
+
+    @unittest.skipUnless(shutil.which("git"), "git is not installed")
+    def test_reset_restores_the_original_files(self):
+        full = sandbox.create(self.path)
+        with open(os.path.join(full, "notes.md"), "w", encoding="utf-8") as f:
+            f.write("changed by an agent")
+        with self.assertRaises(FileExistsError):
+            sandbox.create(self.path)
+        sandbox.create(self.path, reset=True)
+        with open(os.path.join(full, "notes.md"), encoding="utf-8") as f:
+            self.assertIn("status: TODO", f.read())
+
+    def test_never_deletes_a_folder_it_did_not_create(self):
+        os.makedirs(self.path)
+        precious = os.path.join(self.path, "precious.txt")
+        with open(precious, "w", encoding="utf-8") as f:
+            f.write("keep me")
+        for reset in (False, True):
+            with self.assertRaises(ValueError):
+                sandbox.create(self.path, reset=reset)
+        self.assertTrue(os.path.exists(precious))
+
+    def test_refuses_the_repo_its_children_its_parents_and_drive_roots(self):
+        repo = sandbox.REPO
+        for bad in [repo, os.path.join(repo, "sandbox"), os.path.join(repo, "examples"), os.path.dirname(repo), os.path.abspath(os.sep)]:
+            with self.assertRaises(ValueError, msg=bad):
+                sandbox.check_location(bad)
+
+    def test_default_location_is_next_to_the_repo_not_inside_it(self):
+        d = sandbox.check_location(sandbox.default_path())
+        self.assertEqual(os.path.dirname(d), os.path.dirname(sandbox.REPO))
+        self.assertNotEqual(d, sandbox.REPO)
+
+    @unittest.skipUnless(shutil.which("git") and shutil.which("node"), "needs git and node")
+    def test_the_sample_project_really_has_one_failing_test(self):
+        full = sandbox.create(self.path)
+        r = subprocess.run(["node", "--test"], cwd=full, capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("average", r.stdout + r.stderr)
+        # the fix the agent should find
+        p = os.path.join(full, "src", "math.js")
+        with open(p, encoding="utf-8") as f:
+            fixed = f.read().replace("numbers.length + 1", "numbers.length")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(fixed)
+        self.assertEqual(subprocess.run(["node", "--test"], cwd=full, capture_output=True, text=True).returncode, 0)
 
 
 if __name__ == "__main__":

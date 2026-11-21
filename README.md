@@ -83,8 +83,11 @@ python examples/agent.py --model qwen3:8b "Explain how session ids are resolved"
 
 The example agent has `list_dir`, `read_file` and `search`. Add `--allow-write` for `write_file` and `edit_file`, and `--allow-run` for `run_command` (only `git` read-only subcommands, and `cargo` / `npm` test, check and build commands, with no shell). Both ask before every write or command unless you pass `--yes`, and both stay inside `--root`. Try write tasks on a throwaway copy or branch: the allowlist limits what runs, but it is not a sandbox (`cargo test` runs the project's tests).
 
+Try write tasks in a disposable project outside this repo. `examples/sandbox.py` creates one next to it (`../loom-sandbox`): a tiny Node project with a git history and one failing test. `--reset` recreates it, and it will only ever delete a folder it created itself.
+
 ```sh
-python examples/agent.py --model qwen2.5-coder:7b --allow-write --allow-run "Add a unit test for glob_match and run the tests"
+python examples/sandbox.py
+python examples/agent.py --model qwen3:8b --root ../loom-sandbox --allow-write --allow-run "Run the tests, fix the failing one, run them again"
 ```
 
 Then open the session in the UI, set the mode to `Enforce` and a small budget in the Plan tab, and compare what the agent sent with what the model received in the Turn diff tab. A local summarizer can be slow (tens of seconds on a small GPU), so the first call after a change falls back and later calls use the summaries. Set `OLLAMA_CONTEXT_LENGTH` high enough for your prompts, or Ollama silently truncates them.
@@ -129,7 +132,7 @@ crates/
   loom-store/    SQLite persistence and migrations
   loom-server/   gateway, enforce pipeline, summarizer, control API, embedded UI, main binary
 ui/              React + Vite web UI
-examples/        agent.py: a small tool-using agent for trying Loom with any OpenAI-compatible model; test_agent.py tests its safety rules
+examples/        agent.py: a small tool-using agent for trying Loom with any OpenAI-compatible model; sandbox.py: a disposable project to try it on; test_agent.py: tests for both
 ```
 
 `loom-core` does no IO, so the policy logic is unit- and property-tested in isolation.
