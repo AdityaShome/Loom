@@ -19,11 +19,13 @@ export default function ContextList({
   latest,
   plan,
   onEdit,
+  onEditText,
 }: {
   nodes: NodeRow[];
   latest: number;
   plan: Map<string, PlanItem>;
   onEdit: () => void;
+  onEditText?: (id: string) => void;
 }) {
   const [kind, setKind] = useState("");
   const [q, setQ] = useState("");
@@ -54,6 +56,7 @@ export default function ContextList({
         cell: ({ row: { original: n } }) => (
           <div className="content">
             {n.source && <code className="src">{n.source}</code>}
+            {n.edited && <span className="editedtag" title="You replaced what the model sees for this node">edited</span>}
             <span className="preview">{n.preview || <em className="muted">(empty)</em>}</span>
           </div>
         ),
@@ -83,7 +86,7 @@ export default function ContextList({
         id: "controls",
         header: "Controls",
         enableSorting: false,
-        cell: ({ row: { original: n } }) => (n.status === "DroppedByAgent" ? null : <Controls n={n} item={plan.get(n.id)} onEdit={onEdit} />),
+        cell: ({ row: { original: n } }) => (n.status === "DroppedByAgent" ? null : <Controls n={n} item={plan.get(n.id)} onEdit={onEdit} onEditText={onEditText} />),
       }),
       col.accessor("status", {
         header: "Status",
@@ -94,7 +97,7 @@ export default function ContextList({
         ),
       }),
     ],
-    [plan, onEdit],
+    [plan, onEdit, onEditText],
   );
 
   const table = useReactTable({

@@ -25,6 +25,10 @@ export type NodeRow = {
   importance: number;
   pinned: boolean;
   user_action: Action | null;
+  /** You replaced the text the model sees (applied in Enforce). */
+  edited: boolean;
+  /** A block type that cannot be rewritten (thinking, images). */
+  locked: boolean;
   status: string;
   score: number;
   preview: string;
@@ -82,6 +86,8 @@ export type PlanResponse = {
   budget_is_default: boolean;
   weights: Weights;
   pending_changes: boolean;
+  /** Tokens of your notes, already taken out of the budget. */
+  notes_tokens: number;
   summarizer: { model: string; provider: string } | null;
 };
 export type Matcher = {
@@ -91,6 +97,29 @@ export type Matcher = {
   older_than_turns?: number | null;
 };
 export type Rule = { id: string; session_id: string | null; matcher: Matcher; action: Action; priority: number };
+export type EntityKind = "File" | "Symbol" | "Command" | "Error" | "Goal" | "Concept" | "Note";
+export type Source = "auto" | "model" | "user";
+export type Entity = { id: string; session_id: string; kind: EntityKind; name: string; note: string | null; source: Source };
+export type Fact = {
+  id: string;
+  session_id: string;
+  subject_id: string;
+  predicate: string;
+  object_id: string | null;
+  text: string;
+  source: Source;
+  node_id: string | null;
+  /** Sent to the model in Enforce mode. */
+  inject: boolean;
+};
+export type Knowledge = {
+  entities: Entity[];
+  facts: Fact[];
+  /** Exactly what would be appended to the model's request. */
+  memory: { text: string; tokens: number; facts: number } | null;
+  edited_nodes: string[];
+};
+export type NodeDetail = NodeRow & { content: string; override: string | null };
 export type MatchResult = { count: number; tokens: number; ids: string[] };
 
 async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -120,5 +149,19 @@ export const api = {
   createRule: (r: { session_id: string | null; matcher: Matcher; action: Action; priority: number }) =>
     call<Rule>("POST", "/api/rules", r),
   deleteRule: (id: string) => call<void>("DELETE", `/api/rules/${enc(id)}`),
+  knowledge: (id: string) => call<Knowledge>("GET", `/api/sessions/${enc(id)}/knowledge`),
+  createEntity: (session: string, e: { kind: EntityKind; name: string; note?: string }) =>
+    call<Entity>("POST", `/api/sessions/${enc(session)}/knowledge/entities`, e),
+  updateEntity: (id: string, p: { name?: string; kind?: EntityKind; note?: string | null }) =>
+    call<Entity>("PATCH", `/api/knowledge/entities/${enc(id)}`, p),
+  deleteEntity: (id: string) => call<void>("DELETE", `/api/knowledge/entities/${enc(id)}`),
+  createFact: (session: string, f: { subject_id: string; predicate: string; object_id?: string | null; text?: string; inject?: boolean }) =>
+    call<Fact>("POST", `/api/sessions/${enc(session)}/knowledge/facts`, f),
+  updateFact: (id: string, p: { subject_id?: string; predicate?: string; object_id?: string | null; text?: string; inject?: boolean }) =>
+    call<Fact>("PATCH", `/api/knowledge/facts/${enc(id)}`, p),
+  deleteFact: (id: string) => call<void>("DELETE", `/api/knowledge/facts/${enc(id)}`),
+  nodeDetail: (id: string) => call<NodeDetail>("GET", `/api/nodes/${enc(id)}`),
+  setNodeText: (id: string, text: string) => call<void>("PUT", `/api/nodes/${enc(id)}/content`, { text }),
+  clearNodeText: (id: string) => call<void>("DELETE", `/api/nodes/${enc(id)}/content`),
   match: (session: string, m: Matcher) => call<MatchResult>("POST", `/api/sessions/${enc(session)}/match`, m),
 };

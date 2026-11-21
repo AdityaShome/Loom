@@ -35,6 +35,8 @@ function node(p: Partial<NodeRow> & Pick<NodeRow, "kind">): NodeRow {
     importance: 0.5,
     pinned: false,
     user_action: null,
+    edited: false,
+    locked: false,
     status: "Full",
     score: 1,
     preview: p.kind,

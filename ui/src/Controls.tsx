@@ -3,7 +3,9 @@ import { api, type Action, type NodeRow, type PlanItem } from "./api";
 import { fmtTokens } from "./format";
 
 /** Per-node user controls: pin (with its token price), importance, forced action, restore. */
-export default function Controls({ n, item, onEdit }: { n: NodeRow; item?: PlanItem; onEdit: () => void }) {
+const NOT_EDITABLE = ["System", "ToolCall", "Summary"];
+
+export default function Controls({ n, item, onEdit, onEditText }: { n: NodeRow; item?: PlanItem; onEdit: () => void; onEditText?: (id: string) => void }) {
   const [imp, setImp] = useState(n.importance);
   const timer = useRef<number | undefined>(undefined);
   useEffect(() => setImp(n.importance), [n.importance]);
@@ -50,6 +52,11 @@ export default function Controls({ n, item, onEdit }: { n: NodeRow; item?: PlanI
         <option value="Drop">Drop</option>
       </select>
       {shrunk && <button onClick={() => run(api.restore(n.id))}>Restore</button>}
+      {onEditText && !n.locked && !NOT_EDITABLE.includes(n.kind) && (
+        <button onClick={() => onEditText(n.id)} title="Change the text the model sees for this node (applied in Enforce mode)">
+          {n.edited ? "Edited ✎" : "Edit text"}
+        </button>
+      )}
     </div>
   );
 }

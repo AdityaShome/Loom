@@ -15,6 +15,7 @@ It works with any agent framework without code changes: point the agent's base U
 - **Modes.** `Observe` records only. `Suggest` also shows the plan and prepares summaries, but still sends the original request. `Enforce` rewrites the request: dropped nodes are removed, summarized tool results and messages are replaced by short summaries, and the result is validated (role order, tool call/result pairing) before sending. If anything fails, or the plan changes nothing, the original request is sent unchanged.
 - **Summaries.** Produced by a model you configure, cached by content hash, and generated in the background: a request never waits longer than `LOOM_SUMMARIZER_TIMEOUT_MS` (default 300 ms). A summary that is not ready is skipped for that call (the node is kept if it fits, else dropped) and used on the next one.
 - **Prompt-cache friendly.** Decisions for the part of the request that was already sent are repeated, so the provider's prompt cache stays valid, unless the budget forces changes.
+- **Knowledge graph you can edit.** Loom extracts what an agent has seen and done into entities (goal, files, symbols, commands, errors) and facts about them ("this file defines these functions", "this command failed with this error"), each linked to the context node it came from. In the Knowledge tab you can add, change, link and delete things and facts. Tick a fact to **send it to the model**: in Enforce mode it is appended as a `[loom notes]` block to the end of the last user message, so the provider's prompt cache for everything before it is untouched, and its tokens are taken from the budget. You can also **replace the text of a context node** (Context tab, "Edit text"); the original is kept and "Use the original again" restores it. Nothing you add or edit reaches the model outside Enforce mode.
 - **Web UI** served by the same binary: sessions, context list with per-node controls (pin, importance, forced action, restore), plan preview, a context graph (a hub-and-spoke map of what the model sees, with blocks for your pins and rules, the prompt-cache prefix, the token budget, and older reads a newer read has replaced; plus a per-layer token breakdown and a per-turn timeline), rules editor, and a turn-to-turn diff. Updates arrive live over a WebSocket.
 
 Token counts are estimates (about 1 token per 4 characters). Plans use real summary sizes once a summary exists and estimates before that.
@@ -120,9 +121,13 @@ Prefer an instruct or coder model that does not "think" at length (for example `
 | `PUT /api/sessions/{id}` | Set budget, mode (`Observe`, `Suggest` or `Enforce`), scoring weights |
 | `PATCH /api/nodes/{id}` | Set `importance`, `pinned`, `user_action` |
 | `POST /api/nodes/{id}/restore` | Force a node to be kept |
+| `GET /api/sessions/{id}/knowledge` | Entities, facts, and a preview of exactly what would be sent to the model |
+| `POST /api/sessions/{id}/knowledge/entities`, `PATCH/DELETE /api/knowledge/entities/{id}` | Add, change or delete a thing |
+| `POST /api/sessions/{id}/knowledge/facts`, `PATCH/DELETE /api/knowledge/facts/{id}` | Add, change, link, delete a fact; `inject: true` sends it to the model |
+| `GET /api/nodes/{id}`, `PUT/DELETE /api/nodes/{id}/content` | Read a node's full text; replace it, or restore the original |
 | `GET/POST /api/rules`, `PUT/DELETE /api/rules/{id}` | Policy rules |
 | `POST /api/sessions/{id}/match` | Live match count for a rule matcher |
-| `WS /ws/sessions/{id}` | Live events: `turn_completed`, `plan_updated` |
+| `WS /ws/sessions/{id}` | Live events: `turn_completed`, `plan_updated`, `knowledge_updated` |
 
 ## Repository layout
 
@@ -164,6 +169,7 @@ Observe records in the background, so it barely touches the request. Enforce doe
 
 - The store holds **full prompts and tool outputs** in plain text in `loom.db`. Treat it as sensitive.
 - In Enforce mode Loom changes what the model sees. Dropped or summarized context can make an agent lose details; originals are never deleted from the store, and `Restore` or a pin brings a node back on the next call.
+- Facts you mark "send to the model" and text you replace are sent to the model provider in Enforce mode, like any other part of the request. Loom records the agent's own request, never the one it rewrote, so notes do not pile up in the history.
 - Summaries are sent to the summarizer model, so they leave the machine if that model is remote.
 - Loom binds to `127.0.0.1` by default. The control API has **no authentication**, so do not expose it to a network you do not trust.
 - API keys are passed through to the upstream and never written to disk.
@@ -175,6 +181,7 @@ Observe records in the background, so it barely touches the request. Enforce doe
 - Enforce adds latency that grows with context size (see Performance). It is small next to model latency, but it is real.
 - Token counts are rough estimates.
 - Relevance scoring is keyword overlap with the latest user message.
+- The knowledge graph is extracted by fixed rules (tool calls, file contents, command results, error lines), not by a model, so it will miss facts that only appear in prose. You can add those yourself. System prompts, tool calls and locked blocks (thinking, images) cannot be edited.
 - Relation detection links file paths and tool pairs only; URLs and error codes are not matched yet.
 
 ## License

@@ -1,19 +1,24 @@
-import { useMemo, useState } from "react";
+import { lazy, Suspense, useMemo, useState } from "react";
 import { api } from "./api";
 import { useLive, useLoad } from "./hooks";
 import { fmtTokens } from "./format";
 import BudgetBar from "./BudgetBar";
 import ContextGraph from "./ContextGraph";
 import ContextList from "./ContextList";
+import NodeEditor from "./NodeEditor";
 import PlanView from "./PlanView";
 import RulesView from "./RulesView";
 import TurnDiff from "./TurnDiff";
 
-type Tab = "context" | "plan" | "graph" | "rules" | "diff";
+// The knowledge graph uses Cytoscape, which is large: load it only when the tab opens.
+const KnowledgeView = lazy(() => import("./KnowledgeView"));
+
+type Tab = "context" | "plan" | "graph" | "knowledge" | "rules" | "diff";
 const TABS: [Tab, string][] = [
   ["context", "Context"],
   ["plan", "Plan"],
   ["graph", "Graph"],
+  ["knowledge", "Knowledge"],
   ["rules", "Rules"],
   ["diff", "Turn diff"],
 ];
@@ -24,6 +29,7 @@ export default function SessionView({ id }: { id: string }) {
     return TABS.some(([k]) => k === t) ? (t as Tab) : "context";
   });
   const [tick, setTick] = useState(0);
+  const [editNode, setEditNode] = useState<string | null>(null);
   const sessions = useLoad(api.sessions, [id]);
   const nodes = useLoad(() => api.nodes(id), [id]);
   const turns = useLoad(() => api.turns(id), [id]);
@@ -78,7 +84,7 @@ export default function SessionView({ id }: { id: string }) {
         ))}
       </nav>
 
-      {tab === "context" && <ContextList nodes={nodes.data} latest={latest} plan={planById} onEdit={reloadAll} />}
+      {tab === "context" && <ContextList nodes={nodes.data} latest={latest} plan={planById} onEdit={reloadAll} onEditText={setEditNode} />}
       {tab === "plan" &&
         (plan.data ? (
           <PlanView sessionId={id} resp={plan.data} nodes={nodes.data} reload={reloadAll} />
@@ -96,8 +102,22 @@ export default function SessionView({ id }: { id: string }) {
           connected={connected}
         />
       )}
+      {tab === "knowledge" && (
+        <Suspense fallback={<p className="muted">Loading…</p>}>
+          <KnowledgeView sessionId={id} mode={plan.data?.mode ?? session?.mode ?? "Observe"} tick={tick} onEditText={setEditNode} />
+        </Suspense>
+      )}
       {tab === "rules" && <RulesView sessionId={id} tick={tick} />}
       {tab === "diff" && <TurnDiff sessionId={id} turns={turns.data} nodes={nodes.data} />}
+      {editNode && (
+        <NodeEditor
+          key={editNode}
+          nodeId={editNode}
+          mode={plan.data?.mode ?? session?.mode ?? "Observe"}
+          onClose={() => setEditNode(null)}
+          onChanged={reloadAll}
+        />
+      )}
     </>
   );
 }
