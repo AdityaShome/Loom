@@ -16,6 +16,9 @@ use sqlx::{
 };
 use tokio::sync::Mutex;
 
+mod knowledge;
+pub use knowledge::{Entity, EntityPatch, Fact, FactPatch, KgError, Knowledge, NodeDetail};
+
 pub struct Store {
     pool: SqlitePool,
     /// Serializes ingests so read-match-write sequences never interleave.
@@ -92,6 +95,12 @@ pub struct PolicyData {
     pub input: PolicyInput,
     /// node id -> summary text
     pub summaries: HashMap<String, String>,
+    /// node id -> the user's replacement text (Enforce mode shows this to the model instead of the original)
+    pub overrides: HashMap<String, String>,
+    /// Facts the user chose to send, rendered as one block to append to the request.
+    pub memory: Option<String>,
+    /// Tokens that block costs; already subtracted from the plan's budget.
+    pub memory_tokens: u32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -263,6 +272,21 @@ impl Store {
                 .await?
                 .rows_affected() as usize;
         }
+
+        // Knowledge graph: facts about the nodes that are new in this request.
+        let knodes: Vec<loom_core::knowledge::KNode> = msgs
+            .iter()
+            .zip(&ids)
+            .map(|(m, id)| loom_core::knowledge::KNode {
+                id,
+                kind: m.kind,
+                source: m.source.as_deref(),
+                tool_id: m.tool_id.as_deref(),
+                content: &m.content,
+            })
+            .collect();
+        let facts = loom_core::knowledge::extract(&knodes, &new_refs);
+        knowledge::insert_facts(&mut tx, session_id, &facts, "auto").await?;
 
         // Nodes we knew about that the agent stopped sending (it compacted or trimmed).
         let missing = sqlx::query(
@@ -602,7 +626,7 @@ impl Store {
 
         // Skip the (large) content column when the caller already has the text.
         let columns = if msgs.is_some() {
-            "id, session_id, content_hash, occ, kind, role, '' AS content, tokens, first_seen_turn, last_seen_turn,              position, source, importance, pinned, locked, user_action, status, summary_node, score"
+            "id, session_id, content_hash, occ, kind, role, '' AS content, tokens, first_seen_turn, last_seen_turn,              position, source, importance, pinned, locked, override, user_action, status, summary_node, score"
         } else {
             "*"
         };
@@ -622,6 +646,27 @@ impl Store {
                     .get(n.position as usize)
                     .map(|m| m.content.clone())
                     .ok_or_else(|| anyhow!("node position outside the request"))?;
+            }
+        }
+
+        let provider = settings.provider.as_deref().and_then(Provider::parse).unwrap_or(Provider::Anthropic);
+
+        // Text the user replaced: the model sees it instead of the original, so it is what the plan budgets for.
+        let mut overrides: HashMap<String, String> = HashMap::new();
+        for r in sqlx::query(
+            "SELECT id, override FROM nodes WHERE session_id = ? AND last_seen_turn = ? AND override IS NOT NULL",
+        )
+        .bind(session_id)
+        .bind(latest)
+        .fetch_all(&self.pool)
+        .await?
+        {
+            overrides.insert(r.get("id"), r.get("override"));
+        }
+        for n in &mut nodes {
+            if let Some(o) = overrides.get(&n.id) {
+                n.content = o.clone();
+                n.tokens = count_tokens(o) + message_overhead(provider);
             }
         }
 
@@ -673,11 +718,16 @@ impl Store {
             }
         };
 
-        let budget = if settings.budget_tokens > 0 {
+        let mut budget = if settings.budget_tokens > 0 {
             settings.budget_tokens.min(u32::MAX as i64) as u32
         } else {
             budget_for(settings.model.as_deref())
         };
+        // The notes block is part of every request, so the plan gets what is left.
+        let memory = loom_core::knowledge::render_memory(&self.injected_facts(session_id).await?);
+        let memory_tokens = memory.as_deref().map(|m| count_tokens(m) + message_overhead(provider)).unwrap_or(0);
+        budget = budget.saturating_sub(memory_tokens);
+        let no_summary: std::collections::HashSet<String> = overrides.keys().cloned().collect();
         let pnodes = nodes
             .into_iter()
             .map(|n| PNode {
@@ -704,10 +754,14 @@ impl Store {
                 budget,
                 weights: settings.weights,
                 rules: self.list_rules(Some(session_id)).await?,
-                provider: settings.provider.as_deref().and_then(Provider::parse).unwrap_or(Provider::Anthropic),
-                no_summary: Default::default(),
+                provider,
+                // Edited text is the user's: it can be kept or dropped, never replaced by a summary.
+                no_summary,
             },
             summaries: summaries.into_iter().map(|(k, v)| (k, v.0)).collect(),
+            overrides,
+            memory,
+            memory_tokens,
         }))
     }
 
@@ -749,11 +803,13 @@ impl Store {
         turn: u32,
         decisions: &[(String, Action)],
         sent_tokens: u32,
+        // True when the request differs from the agent's even if every node was kept (edited text, added notes).
+        changed: bool,
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         let sent_ids: Vec<&str> = decisions.iter().filter(|d| d.1 != Action::Drop).map(|d| d.0.as_str()).collect();
         let map: HashMap<&str, Action> = decisions.iter().map(|(id, a)| (id.as_str(), *a)).collect();
-        let rewritten = decisions.iter().any(|d| d.1 != Action::Keep);
+        let rewritten = changed || decisions.iter().any(|d| d.1 != Action::Keep);
         sqlx::query(
             "UPDATE snapshots SET sent_node_ids = ?, sent_tokens = ?, rewritten = ?, decisions = ?
              WHERE turn_id = (SELECT id FROM turns WHERE session_id = ? AND idx = ?)",
@@ -812,6 +868,7 @@ fn node_from_row(r: &SqliteRow) -> Result<Node> {
         importance: r.get::<f64, _>("importance") as f32,
         pinned: r.get::<i64, _>("pinned") != 0,
         locked: r.get::<i64, _>("locked") != 0,
+        edited: r.try_get::<Option<String>, _>("override").ok().flatten().is_some(),
         user_action: r.get("user_action"),
         status: Status::parse(r.get("status")).ok_or_else(|| enum_err("status"))?,
         summary_node: r.get("summary_node"),

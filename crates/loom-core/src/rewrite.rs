@@ -19,6 +19,21 @@ enum Op {
     Replace(String),
 }
 
+/// Changes the user asked for beyond the plan: replaced node text, and a block of notes for the model.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Extras<'a> {
+    /// node id -> the text the model should see instead of the original
+    pub overrides: Option<&'a HashMap<String, String>>,
+    /// Appended to the last user message of the request.
+    pub memory: Option<&'a str>,
+}
+
+impl Extras<'_> {
+    pub fn is_empty(&self) -> bool {
+        self.overrides.is_none_or(HashMap::is_empty) && self.memory.is_none()
+    }
+}
+
 /// Apply `plan` to `original`. `msgs` are the normalized messages of `original`
 /// (same order as `plan.items`); `summaries` maps node id to summary text.
 pub fn rewrite(
@@ -28,15 +43,28 @@ pub fn rewrite(
     plan: &Plan,
     summaries: &HashMap<String, String>,
 ) -> Result<Value, String> {
+    rewrite_with(provider, original, msgs, plan, summaries, &Extras::default())
+}
+
+/// Like [`rewrite`], plus the user's own edits.
+pub fn rewrite_with(
+    provider: Provider,
+    original: &Value,
+    msgs: &[CanonMsg],
+    plan: &Plan,
+    summaries: &HashMap<String, String>,
+    extras: &Extras,
+) -> Result<Value, String> {
     if msgs.len() != plan.items.len() {
         return Err(format!("{} messages but {} plan items", msgs.len(), plan.items.len()));
     }
     let mut ops: HashMap<(usize, Option<usize>), Op> = HashMap::new();
     for (m, item) in msgs.iter().zip(&plan.items) {
-        if item.decision == Action::Keep {
+        let edited = extras.overrides.and_then(|o| o.get(&item.id));
+        if item.decision == Action::Keep && edited.is_none() {
             continue;
         }
-        if m.opaque {
+        if m.opaque && (item.decision != Action::Keep || edited.is_some()) {
             return Err(format!("plan would change an unrewritable block ({})", item.id));
         }
         let Loc::Msg { msg, block } = m.loc else {
@@ -47,24 +75,72 @@ pub fn rewrite(
                 ops.insert((msg, block), Op::Drop);
             }
             Action::Summarize if m.kind == NodeKind::ToolCall => {} // call arguments stay verbatim
+            Action::Summarize if edited.is_some() => {
+                return Err(format!("edited node {} cannot also be summarized", item.id))
+            }
             Action::Summarize => {
                 let text = summaries.get(&item.id).ok_or_else(|| format!("no summary for {}", item.id))?;
                 ops.insert((msg, block), Op::Replace(render_summary(text)));
             }
-            Action::Keep => {}
+            Action::Keep => {
+                // The user's own text replaces the node's content as is.
+                if m.kind == NodeKind::ToolCall {
+                    return Err(format!("tool call {} cannot be edited", item.id));
+                }
+                ops.insert((msg, block), Op::Replace(edited.expect("checked above").clone()));
+            }
         }
     }
-    if ops.is_empty() {
+    if ops.is_empty() && extras.memory.is_none() {
         return Ok(original.clone());
     }
     let mut out = original.clone();
     let messages = original.get("messages").and_then(Value::as_array).ok_or("no messages array")?;
-    let new_messages = match provider {
+    let mut new_messages = match provider {
         Provider::Anthropic => anthropic_messages(messages, &ops),
         Provider::OpenAi => openai_messages(messages, &ops),
     };
+    if let Some(memory) = extras.memory {
+        inject_memory(provider, &mut new_messages, memory);
+    }
     out["messages"] = Value::Array(new_messages);
     Ok(out)
+}
+
+/// Add `text` to the end of a message's content, whatever shape the content has.
+fn append_text(msg: &mut Value, text: &str) {
+    match msg.get("content").cloned() {
+        Some(Value::String(s)) => {
+            msg["content"] = Value::String(format!(
+                "{s}
+
+{text}"
+            ))
+        }
+        Some(Value::Array(mut parts)) => {
+            parts.push(serde_json::json!({"type": "text", "text": text}));
+            msg["content"] = Value::Array(parts);
+        }
+        _ => msg["content"] = Value::String(text.to_string()),
+    }
+}
+
+/// Put the notes at the very end of the request, so everything before it (and the provider's prompt cache for it) is
+/// untouched. They go into the last user message; if the request ends otherwise, an OpenAI request gets a new user
+/// message and an Anthropic request (whose last message may be a prefill) uses its last user message.
+fn inject_memory(provider: Provider, messages: &mut Vec<Value>, text: &str) {
+    let last_is_user = messages.last().is_some_and(|m| role(m) == "user");
+    if last_is_user {
+        append_text(messages.last_mut().expect("checked"), text);
+        return;
+    }
+    match provider {
+        Provider::OpenAi => messages.push(serde_json::json!({"role": "user", "content": text})),
+        Provider::Anthropic => match messages.iter().rposition(|m| role(m) == "user") {
+            Some(i) => append_text(&mut messages[i], text),
+            None => messages.push(serde_json::json!({"role": "user", "content": text})),
+        },
+    }
 }
 
 fn anthropic_messages(messages: &[Value], ops: &HashMap<(usize, Option<usize>), Op>) -> Vec<Value> {
@@ -269,6 +345,20 @@ mod tests {
         budget: u32,
         force: &dyn Fn(usize, &CanonMsg) -> Option<Action>,
     ) -> (Plan, Result<Value, String>, Vec<CanonMsg>) {
+        let (p, r, m, _) = pipeline_with(provider, body, budget, force, &|_, _| None, None);
+        (p, r, m)
+    }
+
+    /// Same, plus the user's own text edits and notes. Returns the overrides that were applied.
+    #[allow(clippy::type_complexity)]
+    fn pipeline_with(
+        provider: Provider,
+        body: &Value,
+        budget: u32,
+        force: &dyn Fn(usize, &CanonMsg) -> Option<Action>,
+        edit: &dyn Fn(usize, &CanonMsg) -> Option<String>,
+        memory: Option<&str>,
+    ) -> (Plan, Result<Value, String>, Vec<CanonMsg>, HashMap<String, String>) {
         let n = normalize(provider, body.to_string().as_bytes()).unwrap();
         let ids: Vec<String> = (0..n.msgs.len()).map(|i| format!("n{i}")).collect();
         let gn: Vec<GNode> = n
@@ -285,43 +375,57 @@ mod tests {
             .collect();
         let all: HashSet<&str> = ids.iter().map(String::as_str).collect();
         let edges = build_edges(&gn, &all);
+        // Only nodes the store would accept an edit for: not the system prompt, tool calls or locked blocks.
+        let mut overrides: HashMap<String, String> = HashMap::new();
+        for (i, m) in n.msgs.iter().enumerate() {
+            if !matches!(m.kind, NodeKind::System | NodeKind::ToolCall | NodeKind::Summary) && !m.opaque {
+                if let Some(t) = edit(i, m) {
+                    overrides.insert(ids[i].clone(), t);
+                }
+            }
+        }
         let nodes: Vec<PNode> = n
             .msgs
             .iter()
             .zip(&ids)
             .enumerate()
-            .map(|(i, (m, id))| PNode {
-                id: id.clone(),
-                kind: m.kind,
-                content: m.content.clone(),
-                content_hash: canonical_hash(m),
-                tokens: count_tokens(&m.content) + 4,
-                first_seen_turn: (i / 3) as u32,
-                source: m.source.clone(),
-                importance: 0.5,
-                pinned: false,
-                locked: m.opaque,
-                user_action: force(i, m),
-                summary_tokens: None,
-                prev: Some(Action::Keep),
+            .map(|(i, (m, id))| {
+                let text = overrides.get(id).unwrap_or(&m.content);
+                PNode {
+                    id: id.clone(),
+                    kind: m.kind,
+                    content: text.clone(),
+                    content_hash: canonical_hash(m),
+                    tokens: count_tokens(text) + 4,
+                    first_seen_turn: (i / 3) as u32,
+                    source: m.source.clone(),
+                    importance: 0.5,
+                    pinned: false,
+                    locked: m.opaque,
+                    user_action: force(i, m),
+                    summary_tokens: None,
+                    prev: Some(Action::Keep),
+                }
             })
             .collect();
+        let mem_tokens = memory.map(|m| count_tokens(m) + 4).unwrap_or(0);
         let inp = PolicyInput {
             nodes,
             edges,
             latest_turn: (n.msgs.len() / 3) as u32 + 1,
-            budget,
+            budget: budget.saturating_sub(mem_tokens),
             weights: Weights { protect_tail: 2, ..Weights::default() },
             rules: vec![],
             provider,
-            no_summary: HashSet::new(),
+            no_summary: overrides.keys().cloned().collect(),
         };
         let p = plan(&inp);
         assert_eq!(validate_plan(&inp, &p), Ok(()));
         let summaries: HashMap<String, String> =
             p.items.iter().map(|i| (i.id.clone(), format!("short {}", i.id))).collect();
-        let out = rewrite(provider, body, &n.msgs, &p, &summaries);
-        (p, out, n.msgs)
+        let extras = Extras { overrides: Some(&overrides), memory };
+        let out = rewrite_with(provider, body, &n.msgs, &p, &summaries, &extras);
+        (p, out, n.msgs, overrides)
     }
 
     fn anthropic_body() -> Value {
@@ -466,6 +570,186 @@ mod tests {
         assert!(validate_request(Provider::OpenAi, &oai_orphan).is_err());
     }
 
+    const MEMORY: &str = "[loom notes] Facts the user wants you to keep in mind:\n- average(): divides by n+1";
+
+    #[test]
+    fn edited_text_replaces_what_the_model_sees_and_nothing_else_changes() {
+        let body = anthropic_body();
+        let (_, out, _, applied) = pipeline_with(
+            Provider::Anthropic,
+            &body,
+            100_000,
+            &|_, _| None,
+            &|_, m| m.content.starts_with("fn a").then(|| "EDITED RESULT A".to_string()),
+            None,
+        );
+        assert_eq!(applied.len(), 1);
+        let out = out.unwrap();
+        assert_eq!(validate_request(Provider::Anthropic, &out), Ok(()));
+        let s = out.to_string();
+        assert!(s.contains("EDITED RESULT A") && !s.contains("fn a()"));
+        assert!(s.contains("fn b()"), "other results are untouched");
+        // the tool pair is intact: the call is still there next to its (edited) result
+        assert_eq!(s.matches("\"tool_use\"").count(), 2);
+        assert_eq!(s.matches("\"tool_result\"").count(), 2);
+        // and the original body was not modified in place
+        assert!(body.to_string().contains("fn a()"));
+    }
+
+    #[test]
+    fn edited_text_works_for_messages_and_openai_tool_output() {
+        let body = anthropic_body();
+        let (_, out, _, _) = pipeline_with(
+            Provider::Anthropic,
+            &body,
+            100_000,
+            &|_, _| None,
+            &|_, m| (m.content == "thanks").then(|| "thanks a lot".to_string()),
+            None,
+        );
+        assert!(out.unwrap().to_string().contains("thanks a lot"));
+
+        let oai = json!({"model": "m", "messages": [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"/r/a.rs\"}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "original output"},
+            {"role": "user", "content": "thanks"}]});
+        let (_, out, _, _) = pipeline_with(
+            Provider::OpenAi,
+            &oai,
+            100_000,
+            &|_, _| None,
+            &|_, m| (m.content == "original output").then(|| "edited output".to_string()),
+            None,
+        );
+        let out = out.unwrap();
+        assert_eq!(validate_request(Provider::OpenAi, &out), Ok(()));
+        assert_eq!(out["messages"][3]["content"], "edited output");
+        assert_eq!(out["messages"][3]["tool_call_id"], "c1");
+    }
+
+    #[test]
+    fn an_edit_on_a_dropped_node_is_dropped_with_it() {
+        let body = anthropic_body();
+        let (_, out, _, _) = pipeline_with(
+            Provider::Anthropic,
+            &body,
+            100_000,
+            &|_, m| (m.source.as_deref() == Some("/r/a.rs")).then_some(Action::Drop),
+            &|_, m| m.content.starts_with("fn a").then(|| "EDITED RESULT A".to_string()),
+            None,
+        );
+        let s = out.unwrap().to_string();
+        assert!(!s.contains("EDITED RESULT A") && !s.contains("fn a()"));
+    }
+
+    #[test]
+    fn calls_and_the_system_prompt_are_never_overridden() {
+        let body = anthropic_body();
+        let n = normalize(Provider::Anthropic, body.to_string().as_bytes()).unwrap();
+        let plan = Plan {
+            budget: 1,
+            items: n
+                .msgs
+                .iter()
+                .enumerate()
+                .map(|(i, _)| crate::policy::PlanItem {
+                    id: format!("n{i}"),
+                    decision: Action::Keep,
+                    reason: String::new(),
+                    score: 0.0,
+                    tokens: 1,
+                    planned_tokens: 1,
+                    required: false,
+                })
+                .collect(),
+            original_tokens: 0,
+            planned_tokens: 0,
+            must_tokens: 0,
+            over_budget: false,
+            cache_prefix_len: 0,
+            prefix_frozen: false,
+        };
+        let call = n.msgs.iter().position(|m| m.kind == NodeKind::ToolCall).unwrap();
+        let sys = n.msgs.iter().position(|m| m.kind == NodeKind::System).unwrap();
+        for i in [call, sys] {
+            let o: HashMap<String, String> = [(format!("n{i}"), "x".to_string())].into();
+            let r = rewrite_with(
+                Provider::Anthropic,
+                &body,
+                &n.msgs,
+                &plan,
+                &HashMap::new(),
+                &Extras { overrides: Some(&o), memory: None },
+            );
+            assert!(r.is_err(), "node {i} must not be editable");
+        }
+    }
+
+    #[test]
+    fn notes_go_at_the_end_of_the_last_user_message() {
+        // plain text content
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "first"}, {"role": "assistant", "content": "ok"}, {"role": "user", "content": "last question"}]});
+        let (_, out, _, _) =
+            pipeline_with(Provider::Anthropic, &body, 100_000, &|_, _| None, &|_, _| None, Some(MEMORY));
+        let out = out.unwrap();
+        assert_eq!(validate_request(Provider::Anthropic, &out), Ok(()));
+        assert_eq!(out["messages"][2]["content"], format!("last question\n\n{MEMORY}"));
+        assert_eq!(
+            out["messages"][0]["content"], "first",
+            "earlier messages (and the provider cache for them) are untouched"
+        );
+
+        // a message of tool results: the notes become a text block after the results
+        let with_results = json!({"model": "m", "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "a", "name": "Read", "input": {"file_path": "/r/a.rs"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": "body"}]}]});
+        let (_, out, _, _) =
+            pipeline_with(Provider::Anthropic, &with_results, 100_000, &|_, _| None, &|_, _| None, Some(MEMORY));
+        let out = out.unwrap();
+        assert_eq!(validate_request(Provider::Anthropic, &out), Ok(()));
+        let blocks = out["messages"][2]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "tool_result", "tool results stay first");
+        assert_eq!(blocks[1], json!({"type": "text", "text": MEMORY}));
+    }
+
+    #[test]
+    fn notes_for_openai_requests_that_end_with_tool_output_become_a_new_user_message() {
+        let oai = json!({"model": "m", "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "output"}]});
+        let (_, out, _, _) = pipeline_with(Provider::OpenAi, &oai, 100_000, &|_, _| None, &|_, _| None, Some(MEMORY));
+        let out = out.unwrap();
+        assert_eq!(validate_request(Provider::OpenAi, &out), Ok(()));
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[3], json!({"role": "user", "content": MEMORY}));
+    }
+
+    #[test]
+    fn an_anthropic_prefill_is_left_alone_and_the_notes_use_the_last_user_message() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "question"}),
+            json!({"role": "assistant", "content": "The answer is"}),
+        ];
+        inject_memory(Provider::Anthropic, &mut msgs, MEMORY);
+        assert_eq!(msgs[1]["content"], "The answer is");
+        assert_eq!(msgs[0]["content"], format!("question\n\n{MEMORY}"));
+    }
+
+    #[test]
+    fn without_edits_or_notes_the_body_is_unchanged() {
+        let body = anthropic_body();
+        let (_, out, _, applied) = pipeline_with(Provider::Anthropic, &body, 100_000, &|_, _| None, &|_, _| None, None);
+        assert!(applied.is_empty());
+        assert_eq!(out.unwrap(), body);
+        assert!(Extras::default().is_empty());
+        assert!(!Extras { memory: Some("x"), ..Default::default() }.is_empty());
+    }
+
     // ------------------------------------------------ end-to-end property tests
 
     #[derive(Debug, Clone)]
@@ -537,8 +821,48 @@ mod tests {
         json!({"model": "m", "messages": msgs})
     }
 
+    /// Roughly one in four eligible nodes is edited.
+    fn edits(seed: u64) -> impl Fn(usize, &CanonMsg) -> Option<String> {
+        move |i, _| ((seed >> (i % 50)) & 3 == 0).then(|| format!("EDITED {i} for the model"))
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(300))]
+
+        #[test]
+        fn edits_and_notes_never_break_a_request(
+            turns in prop::collection::vec(turn(), 0..14),
+            budget in 0u32..6000,
+            thinking in proptest::option::of(0usize..14),
+            seed in any::<u64>(),
+            openai in any::<bool>(),
+            notes in any::<bool>(),
+        ) {
+            let (provider, body) = if openai {
+                (Provider::OpenAi, openai_conversation(&turns))
+            } else {
+                (Provider::Anthropic, anthropic_conversation(&turns, thinking))
+            };
+            let memory = notes.then_some(MEMORY);
+            let force = move |i: usize, _: &CanonMsg| match (seed >> ((i + 7) % 60)) & 3 {
+                0 => Some(Action::Drop),
+                1 => Some(Action::Summarize),
+                _ => None,
+            };
+            let (p, out, msgs, applied) = pipeline_with(provider, &body, budget, &force, &edits(seed), memory);
+            let out = out.map_err(|e| TestCaseError::fail(format!("rewrite failed: {e}")))?;
+            prop_assert_eq!(validate_request(provider, &out), Ok(()));
+            let s = out.to_string();
+            // Notes appear exactly once, and only when asked for.
+            prop_assert_eq!(s.matches("[loom notes]").count(), usize::from(notes));
+            // An edit shows up if and only if its node was kept.
+            for (item, m) in p.items.iter().zip(&msgs) {
+                if let Some(text) = applied.get(&item.id) {
+                    let present = s.contains(text.as_str());
+                    prop_assert_eq!(present, item.decision == Action::Keep, "{} ({:?}) visible={} decision={:?}", item.id, m.kind, present, item.decision);
+                }
+            }
+        }
 
         #[test]
         fn rewritten_anthropic_requests_always_validate(

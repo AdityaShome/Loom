@@ -149,6 +149,8 @@ async fn proxy(AxState(st): AxState<Arc<State>>, req: Request) -> Response {
                         sent_tokens = done.sent_tokens,
                         summarized = done.summarized,
                         dropped = done.dropped,
+                        edited = done.edited,
+                        notes_tokens = done.memory_tokens,
                         rewritten = done.body.is_some(),
                         "enforced"
                     );

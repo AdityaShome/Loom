@@ -9,7 +9,7 @@ use loom_core::{
     model::{Action, NodeKind, Provider},
     normalize::normalize,
     policy::{plan, validate_plan, PNode},
-    rewrite::{rewrite, validate_request},
+    rewrite::{rewrite_with, validate_request, Extras},
 };
 use loom_store::Store;
 use tokio::sync::broadcast::Sender;
@@ -22,12 +22,16 @@ use crate::{
 /// What Enforce did to one request.
 #[derive(Debug)]
 pub struct Enforced {
-    /// The rewritten body, or `None` when every node is kept (send the original bytes).
+    /// The rewritten body, or `None` when nothing changes (send the original bytes).
     pub body: Option<Bytes>,
     pub original_tokens: u32,
     pub sent_tokens: u32,
     pub summarized: usize,
     pub dropped: usize,
+    /// Nodes whose text the user replaced.
+    pub edited: usize,
+    /// Tokens of the notes block appended to the request (0 when none).
+    pub memory_tokens: u32,
 }
 
 /// Run one request through the full pipeline: ingest, plan, summaries, rewrite, validate.
@@ -135,27 +139,35 @@ pub async fn enforce(
         .filter(|(i, n)| i.decision == Action::Summarize && n.kind != NodeKind::ToolCall)
         .count();
     let dropped = plan.items.iter().filter(|i| i.decision == Action::Drop).count();
+    // The user's own edits apply to nodes that stay; a dropped node's edit goes with it.
+    let edited = plan.items.iter().filter(|i| i.decision == Action::Keep && data.overrides.contains_key(&i.id)).count();
+    let adds_notes = data.memory.is_some();
 
-    if summarized == 0 && dropped == 0 {
-        store.record_enforced(session, ingested.turn, &decisions, ingested.tokens).await?;
+    if summarized == 0 && dropped == 0 && edited == 0 && !adds_notes {
+        store.record_enforced(session, ingested.turn, &decisions, ingested.tokens, false).await?;
         return Ok(Enforced {
             body: None,
             original_tokens: ingested.tokens,
             sent_tokens: ingested.tokens,
             summarized,
             dropped,
+            edited,
+            memory_tokens: 0,
         });
     }
 
-    let rewritten =
-        rewrite(provider, &norm.raw, &norm.msgs, &plan, &data.summaries).map_err(|e| anyhow!("rewrite failed: {e}"))?;
+    let extras = Extras { overrides: Some(&data.overrides), memory: data.memory.as_deref() };
+    let rewritten = rewrite_with(provider, &norm.raw, &norm.msgs, &plan, &data.summaries, &extras)
+        .map_err(|e| anyhow!("rewrite failed: {e}"))?;
     validate_request(provider, &rewritten).map_err(|e| anyhow!("rewritten request is invalid: {e}"))?;
     let bytes = Bytes::from(serde_json::to_vec(&rewritten)?);
-    if bytes.len() >= body.len() {
+    // A rewrite that only removes or shrinks things must come out smaller; edits and notes can legitimately add text.
+    if edited == 0 && !adds_notes && bytes.len() >= body.len() {
         bail!("rewritten request is not smaller ({} >= {} bytes)", bytes.len(), body.len());
     }
     let t_rewrite = t0.elapsed();
-    store.record_enforced(session, ingested.turn, &decisions, plan.planned_tokens).await?;
+    let sent_tokens = plan.planned_tokens + data.memory_tokens;
+    store.record_enforced(session, ingested.turn, &decisions, sent_tokens, true).await?;
     tracing::debug!(
         normalize_us = t_norm.as_micros() as u64,
         ingest_us = (t_ingest - t_norm).as_micros() as u64,
@@ -169,9 +181,11 @@ pub async fn enforce(
     Ok(Enforced {
         body: Some(bytes),
         original_tokens: ingested.tokens,
-        sent_tokens: plan.planned_tokens,
+        sent_tokens,
         summarized,
         dropped,
+        edited,
+        memory_tokens: data.memory_tokens,
     })
 }
 

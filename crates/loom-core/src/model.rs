@@ -32,6 +32,10 @@ str_enum!(
     /// What to do with a node when building the next request.
     Action { Keep, Summarize, Drop }
 );
+str_enum!(
+    /// What kind of thing a knowledge-graph entity is. Concept and Note are for things you add yourself.
+    EntityKind { File, Symbol, Command, Error, Goal, Concept, Note }
+);
 str_enum!(Status { Full, Summarized, Dropped, DroppedByAgent });
 
 /// Where a node came from in the request body, so the rewriter can edit it in place.
@@ -81,6 +85,8 @@ pub struct Node {
     pub pinned: bool,
     /// Cannot be rewritten (see `CanonMsg::opaque`).
     pub locked: bool,
+    /// The user replaced the text the model sees for this node.
+    pub edited: bool,
     pub user_action: Option<String>,
     pub status: Status,
     pub summary_node: Option<String>,
