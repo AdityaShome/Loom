@@ -71,14 +71,14 @@ Requests appear in the UI as sessions. To name a session explicitly, send an `x-
 Point the OpenAI upstream at a local server (Ollama, vLLM, llama.cpp), and optionally use a local model for summaries too:
 
 ```sh
-ollama pull qwen3:4b
+ollama pull qwen3:8b
 export LOOM_OPENAI_UPSTREAM=http://localhost:11434
-export LOOM_SUMMARIZER_MODEL=qwen3:4b
+export LOOM_SUMMARIZER_MODEL=qwen3:8b
 export LOOM_SUMMARIZER_URL=http://localhost:11434
 cargo run --release
 
 # in another terminal: a small tool-using agent that talks to Loom (read-only by default)
-python examples/agent.py --model qwen3:4b "Explain how session ids are resolved"
+python examples/agent.py --model qwen3:8b "Explain how session ids are resolved"
 ```
 
 The example agent has `list_dir`, `read_file` and `search`. Add `--allow-write` for `write_file` and `edit_file`, and `--allow-run` for `run_command` (only `git` read-only subcommands, and `cargo` / `npm` test, check and build commands, with no shell). Both ask before every write or command unless you pass `--yes`, and both stay inside `--root`. Try write tasks on a throwaway copy or branch: the allowlist limits what runs, but it is not a sandbox (`cargo test` runs the project's tests).
@@ -93,7 +93,7 @@ If the database cannot be opened, Loom logs an error and keeps proxying without 
 
 ### Choosing a local model
 
-What I have actually run is Qwen3 4B: fine for short read-only tasks (a few tool calls), but it repeats calls, rambles in its replies even with thinking turned off, and is not reliable for edits. The rest are rules of thumb, not measurements:
+What I have actually run: Qwen3 4B, which is fine for short read-only tasks but repeats calls, rambles in its replies even with thinking turned off, and is not reliable for edits; and Qwen3 8B, which completed a two-step edit-and-run task (edit a file, then `git diff`) correctly in two model calls. The rest are rules of thumb, not measurements:
 
 | Size | Good for | Memory at 4-bit |
 |---|---|---|

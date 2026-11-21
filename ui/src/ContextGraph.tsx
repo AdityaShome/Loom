@@ -7,6 +7,7 @@ import ContextFlow from "./ContextFlow";
 import GraphPanel from "./GraphPanel";
 import MindMap from "./MindMap";
 import {
+  ago,
   basename,
   buildModel,
   decisionOf,
@@ -118,6 +119,17 @@ export default function ContextGraph({
   const [full, setFull] = useState(false);
   const root = useRef<HTMLElement>(null);
 
+  // Show that the picture is live: when it last changed, ticking every second.
+  const [updatedAt, setUpdatedAt] = useState<number | null>(null);
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (graph.data) setUpdatedAt(Date.now());
+  }, [graph.data]);
+  useEffect(() => {
+    const t = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, []);
+
   useEffect(() => {
     const on = () => setFull(document.fullscreenElement === root.current);
     document.addEventListener("fullscreenchange", on);
@@ -164,7 +176,14 @@ export default function ContextGraph({
           <h3>Context Graph</h3>
           <p>What the model sees on the next call, grouped by where it came from</p>
         </div>
-        <span className={`cg-live ${connected ? "on" : ""}`}>{connected ? "Live" : "Reconnecting"}</span>
+        <div className="cg-status">
+          <span className={`cg-live ${connected ? "on" : ""}`}>{connected ? "Live" : "Reconnecting"}</span>
+          {updatedAt && (
+            <small className="cg-updated" title="When the graph last received data from Loom">
+              turn {latest + 1} · updated {ago((now - updatedAt) / 1000)}
+            </small>
+          )}
+        </div>
       </header>
 
       <div className="cg-bar-row">

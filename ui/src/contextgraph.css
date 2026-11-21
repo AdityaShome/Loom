@@ -209,3 +209,15 @@
 /* gauge on the centre node: tokens in context against the budget */
 .cg-gauge { position: absolute; left: 16px; right: 16px; bottom: 8px; height: 4px; border-radius: 2px; background: #16203a; overflow: hidden; }
 .cg-gauge i { display: block; height: 100%; border-radius: 2px; transition: width 0.3s; }
+
+/* live-update cues */
+.cg-status { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+.cg-updated { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.cg-card.flash { animation: cg-flash 1.5s ease-out; }
+@keyframes cg-flash {
+  0% { box-shadow: 0 0 0 3px var(--c), 0 0 46px var(--c); filter: brightness(1.5); }
+  100% { filter: brightness(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cg-card.flash { animation: none; outline: 2px solid var(--c); }
+}

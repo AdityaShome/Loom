@@ -262,7 +262,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("task", nargs="?", default="Explore this project and explain how session ids are resolved.")
     ap.add_argument("--base-url", default="http://localhost:7070/v1", help="Loom's OpenAI endpoint")
-    ap.add_argument("--model", default="qwen3:4b")
+    ap.add_argument("--model", default="qwen3:8b")
     ap.add_argument("--session", default="qwen-demo", help="session name shown in the Loom UI")
     ap.add_argument("--root", default=".", help="project directory the tools may read (and write, with --allow-write)")
     ap.add_argument("--max-steps", type=int, default=15)

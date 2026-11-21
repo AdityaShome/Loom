@@ -130,6 +130,15 @@ export function compact(n: number): string {
   return n < 1000 ? String(n) : n < 10_000 ? `${(n / 1000).toFixed(1)}k` : `${Math.round(n / 1000)}k`;
 }
 
+/** "just now", "12s ago", "3 min ago", "2h ago". */
+export function ago(seconds: number): string {
+  const s = Math.max(0, Math.floor(seconds));
+  if (s < 3) return "just now";
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  return `${Math.floor(s / 3600)}h ago`;
+}
+
 const sum = (ns: NodeRow[]) => ns.reduce((s, n) => s + n.tokens, 0);
 const plural = (n: number, one: string, many = one + "s") => `${n} ${n === 1 ? one : many}`;
 

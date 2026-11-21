@@ -132,6 +132,23 @@ export default function MindMap({ model, hidden, selection, onSelect, title, sub
     });
   };
 
+  // Briefly flash any block whose numbers just changed, so a live update is visible.
+  const lastSeen = useRef<Map<string, string>>(new Map());
+  const [flash, setFlash] = useState<Set<string>>(new Set());
+  const signature = JSON.stringify([title, subtitle, hubs.map((h) => [h.id, h.subtitle, h.leaves.map((l) => l.sub)])]);
+  useEffect(() => {
+    const next = new Map<string, string>([["center", `${title}|${subtitle}|${model.total}`]]);
+    hubs.forEach((h) => next.set(h.id, `${h.subtitle}|${h.leaves.map((l) => `${l.label}${l.sub}`).join(",")}`));
+    const changed = new Set<string>();
+    next.forEach((v, k) => lastSeen.current.has(k) && lastSeen.current.get(k) !== v && changed.add(k));
+    lastSeen.current = next;
+    if (!changed.size) return;
+    setFlash(changed);
+    const t = window.setTimeout(() => setFlash(new Set()), 1600);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [signature]);
+
   const q = query.trim().toLowerCase();
   const matching = useMemo(() => {
     if (!q) return null;
@@ -156,7 +173,7 @@ export default function MindMap({ model, hidden, selection, onSelect, title, sub
     cards.push(
       <button
         key={`hub-${h.id}`}
-        className={`cg-card cg-hub ${isSel({ kind: "hub", id: h.id }) ? "sel" : ""} ${hubDim ? "dim" : ""}`}
+        className={`cg-card cg-hub ${isSel({ kind: "hub", id: h.id }) ? "sel" : ""} ${hubDim ? "dim" : ""} ${flash.has(h.id) ? "flash" : ""}`}
         style={{ left: p.x - HUB.w / 2, top: p.y - HUB.h / 2, width: HUB.w, height: HUB.h, ["--c" as string]: h.color }}
         onClick={() => onSelect({ kind: "hub", id: h.id })}
         aria-label={`${h.title}: ${h.subtitle}`}
@@ -243,7 +260,7 @@ export default function MindMap({ model, hidden, selection, onSelect, title, sub
 
         {model.nodes.length > 0 && (
           <button
-            className={`cg-card cg-center ${selection.kind === "center" ? "sel" : ""}`}
+            className={`cg-card cg-center ${selection.kind === "center" ? "sel" : ""} ${flash.has("center") ? "flash" : ""}`}
             style={{ left: CX - CENTER.w / 2, top: CY - CENTER.h / 2, width: CENTER.w, height: CENTER.h, ["--c" as string]: "#60a5fa" }}
             onClick={() => onSelect({ kind: "center" })}
             aria-label={`${title}: ${subtitle}`}

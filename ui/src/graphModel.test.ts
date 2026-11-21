@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Edge, NodeRow, Plan, Rule } from "./api";
 import { layoutHubs } from "./MindMap";
 import {
+  ago,
   buildModel,
   capLeaves,
   centerInsights,
@@ -368,6 +369,22 @@ describe("status blocks", () => {
     expect(text("cache")).toContain("stays valid");
     expect(text("waste")).toContain("1,400 tokens sit in 1 older read");
     expect(text("controls")).toContain("1 node pinned");
+  });
+});
+
+describe("ago", () => {
+  it("formats how long ago something happened", () => {
+    expect([ago(0), ago(2.9), ago(3), ago(59), ago(60), ago(185), ago(3600), ago(7300), ago(-5)]).toEqual([
+      "just now",
+      "just now",
+      "3s ago",
+      "59s ago",
+      "1 min ago",
+      "3 min ago",
+      "1h ago",
+      "2h ago",
+      "just now",
+    ]);
   });
 });
 
