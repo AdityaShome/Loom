@@ -3,3 +3,5 @@ loom.db*
 node_modules/
 ui/dist/*
 !ui/dist/.gitkeep
+__pycache__/
+*.pyc

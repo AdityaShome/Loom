@@ -77,13 +77,32 @@ export LOOM_SUMMARIZER_MODEL=qwen3:4b
 export LOOM_SUMMARIZER_URL=http://localhost:11434
 cargo run --release
 
-# in another terminal: a small read-only tool-using agent that talks to Loom
+# in another terminal: a small tool-using agent that talks to Loom (read-only by default)
 python examples/agent.py --model qwen3:4b "Explain how session ids are resolved"
+```
+
+The example agent has `list_dir`, `read_file` and `search`. Add `--allow-write` for `write_file` and `edit_file`, and `--allow-run` for `run_command` (only `git` read-only subcommands, and `cargo` / `npm` test, check and build commands, with no shell). Both ask before every write or command unless you pass `--yes`, and both stay inside `--root`. Try write tasks on a throwaway copy or branch: the allowlist limits what runs, but it is not a sandbox (`cargo test` runs the project's tests).
+
+```sh
+python examples/agent.py --model qwen2.5-coder:7b --allow-write --allow-run "Add a unit test for glob_match and run the tests"
 ```
 
 Then open the session in the UI, set the mode to `Enforce` and a small budget in the Plan tab, and compare what the agent sent with what the model received in the Turn diff tab. A local summarizer can be slow (tens of seconds on a small GPU), so the first call after a change falls back and later calls use the summaries. Set `OLLAMA_CONTEXT_LENGTH` high enough for your prompts, or Ollama silently truncates them.
 
 If the database cannot be opened, Loom logs an error and keeps proxying without recording. Internal errors in recording never affect the agent's request.
+
+### Choosing a local model
+
+What I have actually run is Qwen3 4B: fine for short read-only tasks (a few tool calls), but it repeats calls, rambles in its replies even with thinking turned off, and is not reliable for edits. The rest are rules of thumb, not measurements:
+
+| Size | Good for | Memory at 4-bit |
+|---|---|---|
+| 3-4B | one or two tool calls, demos | about 2.5 GB |
+| 7-8B | reading and explaining code, small edits; tool calling is usually dependable from here | about 5 GB |
+| 14B | multi-file changes and following a plan | about 9 GB |
+| 30B+ | long, sustained agent work | 20 GB or more |
+
+Prefer an instruct or coder model that does not "think" at length (for example `qwen2.5-coder:7b`): thinking models can spend thousands of tokens per step, which is slow on a small GPU. Give the model at least an 8k context (`OLLAMA_CONTEXT_LENGTH=8192`). For real coding work, a hosted model through Loom is the better choice.
 
 ## Control API
 
@@ -110,7 +129,7 @@ crates/
   loom-store/    SQLite persistence and migrations
   loom-server/   gateway, enforce pipeline, summarizer, control API, embedded UI, main binary
 ui/              React + Vite web UI
-examples/        agent.py: a tiny tool-using agent for trying Loom with any OpenAI-compatible model
+examples/        agent.py: a small tool-using agent for trying Loom with any OpenAI-compatible model; test_agent.py tests its safety rules
 ```
 
 `loom-core` does no IO, so the policy logic is unit- and property-tested in isolation.

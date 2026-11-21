@@ -22,6 +22,7 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 (cd ui && npm run typecheck && npm test && npm run build)
+python examples/test_agent.py   # the example agent's safety rules
 ```
 
 `cargo fmt` fixes formatting (settings are in `rustfmt.toml`).
